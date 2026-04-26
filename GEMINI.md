@@ -65,10 +65,18 @@ kino/
 └── docs/                   # Documentation and Changelog
 ```
 
-## Build Instructions
-This project is standalone. To compile using `arduino-cli`:
+## Build & Upload Instructions
+This project is standalone.
+
+### 1. Compile
 ```bash
 arduino-cli compile --fqbn esp32:esp32:esp32s3 --libraries libraries kino.ino
+```
+
+### 2. Upload
+Replace `/dev/cu.usbmodem14201` with your actual device port.
+```bash
+arduino-cli upload -p /dev/cu.usbmodem14201 --fqbn esp32:esp32:esp32s3 kino.ino
 ```
 
 **Required Board Settings:**
