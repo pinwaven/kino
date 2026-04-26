@@ -24,6 +24,7 @@ All notable changes to the **Kino Biomarker Analyzer** project will be documente
 - **Compiler Error**: Fixed "initializer element is not constant" in SVG descriptor by changing pointer declarations to array declarations.
 
 ### Removed
+- Root `assets/` folder (consolidated into `src/ui/assets/`).
 - Redundant `waven_logo.c` bitmap file (migrated to SVG).
 - Duplicate `pin_config.h` from `libraries/Mylibrary/`.
 - Outdated LVGL v8 components moved to `libraries/lvgl/v8_backup/`.
