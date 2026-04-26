@@ -1,6 +1,7 @@
 #include "ui.h"
 #include "lvgl.h"
 #include "assets/waven_logo_svg.h"
+#include "assets/animated_dot_svg.h"
 #include <stdlib.h>
 
 static lv_obj_t * text_circle;
@@ -8,6 +9,11 @@ static lv_obj_t * text_circle;
 void ui_init() {
   lv_obj_t * screen = lv_screen_active();
   lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), 0);
+
+  // Animated Dot SVG (centered background)
+  lv_obj_t * anim_svg = lv_image_create(screen);
+  lv_image_set_src(anim_svg, &animated_dot_svg_dsc);
+  lv_obj_center(anim_svg);
 
   // Circles
   lv_obj_t * edge = lv_obj_create(screen);
