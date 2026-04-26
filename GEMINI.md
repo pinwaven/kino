@@ -51,6 +51,20 @@ const lv_image_dsc_t waven_logo_svg_dsc = {
 **Issue:** ThorVG (SVG engine) and LVGL v9 require significant heap memory for vector rasterization.
 **Fix:** Configured `lv_conf.h` to use the system `malloc` (`LV_STDLIB_CLIB`), allowing LVGL to automatically utilize the 8MB of OPI PSRAM available on the ESP32-S3.
 
+## Project Structure
+```text
+kino/
+├── kino.ino                # Main orchestrator
+├── pin_config.h            # Hardware pin definitions
+├── src/
+│   ├── hal/                # Hardware Abstraction Layer (Display, Touch)
+│   ├── ui/                 # UI layouts, screens, and assets
+│   │   └── assets/         # SVG/Image sources and descriptors
+│   └── core/               # Biomarker analysis logic
+├── libraries/              # Local dependencies (LVGL v9, GFX, etc.)
+└── docs/                   # Documentation and Changelog
+```
+
 ## Build Instructions
 This project is standalone. To compile using `arduino-cli`:
 ```bash
