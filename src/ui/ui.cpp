@@ -1,24 +1,21 @@
 #include "ui.h"
 #include "lvgl.h"
-#include "assets/waven_logo_svg.h"
-#include "assets/animated_dot_svg.h"
 #include "../hal/WiFi.h"
 #include <stdlib.h>
 
-static lv_obj_t * text_circle;
-static lv_obj_t * debug_label;
+static lv_obj_t * wifi_label;
 
 static void wifi_timer_cb(lv_timer_t * timer) {
   wifi_hal_status_t status = hal_wifi_get_status();
   if (status == WIFI_STATUS_CONNECTED) {
     String ip = hal_wifi_get_ip();
-    lv_label_set_text_fmt(debug_label, "IP: %s", ip.c_str());
+    lv_label_set_text_fmt(wifi_label, "IP: %s", ip.c_str());
   } else if (status == WIFI_STATUS_CONNECTING) {
-    lv_label_set_text(debug_label, "WiFi: Connecting...");
+    lv_label_set_text(wifi_label, "WiFi: Connecting...");
   } else if (status == WIFI_STATUS_ERROR) {
-    lv_label_set_text(debug_label, "WiFi: Error");
+    lv_label_set_text(wifi_label, "WiFi: Error");
   } else {
-    lv_label_set_text(debug_label, "WiFi: Disconnected");
+    lv_label_set_text(wifi_label, "WiFi: Disconnected");
   }
 }
 
@@ -26,65 +23,19 @@ void ui_init() {
   lv_obj_t * screen = lv_screen_active();
   lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), 0);
 
-  // Circles
-  lv_obj_t * edge = lv_obj_create(screen);
-  lv_obj_set_size(edge, 460, 460); lv_obj_center(edge);
-  lv_obj_set_style_radius(edge, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_opa(edge, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_color(edge, lv_color_hex(0x0000FF), 0);
-  lv_obj_set_style_border_width(edge, 3, 0);
+  // KINO Large Label
+  lv_obj_t * kino_label = lv_label_create(screen);
+  lv_label_set_text(kino_label, "KINO");
+  lv_obj_set_style_text_font(kino_label, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(kino_label, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_align(kino_label, LV_ALIGN_CENTER, 0, -40);
 
-  text_circle = lv_obj_create(screen);
-  lv_obj_set_size(text_circle, 320, 320); lv_obj_center(text_circle);
-  lv_obj_set_style_radius(text_circle, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_opa(text_circle, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_color(text_circle, lv_color_hex(0x00FF00), 0);
-  lv_obj_set_style_border_width(text_circle, 5, 0);
-
-  // Animated Dot SVG (Manual LVGL Animation)
-  lv_obj_t * anim_svg = lv_image_create(screen);
-  lv_image_set_src(anim_svg, &animated_dot_svg_dsc);
-  lv_obj_set_size(anim_svg, 200, 200);
-  lv_obj_center(anim_svg);
-
-  // LVGL Animation to move the SVG object
-  lv_anim_t a;
-  lv_anim_init(&a);
-  lv_anim_set_var(&a, anim_svg);
-  lv_anim_set_values(&a, -100, 100);
-  lv_anim_set_duration(&a, 2000);
-  lv_anim_set_playback_duration(&a, 2000);
-  lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-  lv_anim_set_exec_cb(&a, [](void * var, int32_t v) {
-    lv_obj_set_x((lv_obj_t *)var, v);
-  });
-  lv_anim_start(&a);
-
-  // Layout Container
-  lv_obj_t * cont = lv_obj_create(screen);
-  lv_obj_set_size(cont, 300, 150); lv_obj_center(cont);
-  lv_obj_set_style_bg_opa(cont, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_width(cont, 0, 0);
-  lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_ROW);
-  lv_obj_set_flex_align(cont, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-  // SVG IMAGE - Using Descriptor from assets
-  lv_obj_t * svg_img = lv_image_create(cont);
-  lv_image_set_src(svg_img, &waven_logo_svg_dsc);
-  
-  // BUTTON
-  lv_obj_t * btn = lv_button_create(cont);
-  lv_obj_set_size(btn, 80, 50);
-  lv_obj_set_style_bg_color(btn, lv_color_hex(0xFFA500), 0); // Orange
-  lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
-  lv_obj_t * bl = lv_label_create(btn); lv_label_set_text(bl, "CLR"); lv_obj_center(bl);
-  lv_obj_add_event_cb(btn, [](lv_event_t*e){ 
-    lv_obj_set_style_border_color(text_circle, lv_color_hex(rand() % 0xFFFFFF), 0);
-  }, LV_EVENT_CLICKED, NULL);
-
-  debug_label = lv_label_create(screen);
-  lv_label_set_text(debug_label, "Initializing WiFi...");
-  lv_obj_align(debug_label, LV_ALIGN_BOTTOM_MID, 0, -40);
+  // Larger WiFi Status Label
+  wifi_label = lv_label_create(screen);
+  lv_label_set_text(wifi_label, "WiFi: Init...");
+  lv_obj_set_style_text_font(wifi_label, &lv_font_montserrat_24, 0);
+  lv_obj_set_style_text_color(wifi_label, lv_color_hex(0x00FF00), 0);
+  lv_obj_align_to(wifi_label, kino_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 20);
 
   // Create a timer to update WiFi status
   lv_timer_create(wifi_timer_cb, 1000, NULL);

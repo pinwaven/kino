@@ -30,8 +30,11 @@ All notable changes to the **Kino Biomarker Analyzer** project will be documente
   - Added `src/ui/assets/animated_dot_svg` as a test asset.
 - **WiFi HAL Implementation**:
   - Added `src/hal/WiFi.h/.cpp` for asynchronous connection management.
-  - Integrated WiFi status monitoring into the UI (Debug Label updates with IP).
+  - Successfully verified connection to "WAVEN-SHW" with IP display.
   - Added git-ignored `src/hal/local_config.h` for credentials.
+- **UI Stabilization**:
+  - Simplified UI to a minimal "KINO" label and status display to resolve intermittent screen blackouts.
+  - Enabled Montserrat 24 and 48 fonts in `lv_conf.h`.
 - **Build System Update**:
   - Updated FQBN to support 16MB Flash and OPI PSRAM (`PartitionScheme=app3M_fat9M_16MB`).
   - Resolved "Sketch too big" error by expanding the APP partition.
