@@ -25,6 +25,13 @@ static void rounder_event_cb(lv_event_t * e) {
 }
 
 void hal_display_init() {
+  // Hardware Reset
+  pinMode(LCD_RESET, OUTPUT);
+  digitalWrite(LCD_RESET, LOW);
+  delay(100);
+  digitalWrite(LCD_RESET, HIGH);
+  delay(100);
+
   if (!gfx->begin()) {
     Serial.println("GFX Error");
   }
