@@ -23,6 +23,12 @@ All notable changes to the **Kino Biomarker Analyzer** project will be documente
   - Resolved `multiple definition` and `fatal error: missing header` issues caused by the v8/v9 mix.
 - **Compiler Error**: Fixed "initializer element is not constant" in SVG descriptor by changing pointer declarations to array declarations.
 
+### Added
+- **GUI Capability Test**: 
+  - Verified SVG rendering support.
+  - Verified LVGL native animation system compatibility with SVG assets.
+  - Added `src/ui/assets/animated_dot_svg` as a test asset.
+
 ### Removed
 - Root `assets/` folder (consolidated into `src/ui/assets/`).
 - Redundant `waven_logo.c` bitmap file (migrated to SVG).
