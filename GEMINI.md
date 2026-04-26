@@ -65,6 +65,15 @@ kino/
 └── docs/                   # Documentation and Changelog
 ```
 
+## Changelog
+For a detailed history of changes, see [docs/CHANGELOG.md](docs/CHANGELOG.md).
+
+### Recent Milestones (v1.0.0)
+- **Modular HAL/UI**: Extracted hardware and interface logic into a cleaner structure.
+- **WiFi Integration**: Added stable WiFi connection management and IP status monitoring.
+- **Library Stabilization**: Fixed critical LVGL v8/v9 version conflicts and GFX compatibility issues.
+- **UI Stabilization**: Optimized the interface to prevent intermittent screen blackouts.
+
 ## Build & Upload Instructions
 This project requires specific board settings for the 16MB Flash and OPI PSRAM.
 
