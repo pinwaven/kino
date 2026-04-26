@@ -14,6 +14,18 @@ This project is a standalone implementation for the **Waveshare ESP32-S3-Touch-A
 - [x] LVGL v9.4.0 integration successful.
 - [x] Native SVG rendering functional.
 - [x] Touch interactivity functional.
+- [x] WiFi connectivity verified.
+
+## Network Configuration
+WiFi credentials are managed in a local configuration file that is excluded from version control for security.
+
+1.  Create/Edit `src/hal/local_config.h`:
+    ```cpp
+    #pragma once
+    #define WIFI_SSID "YOUR_SSID"
+    #define WIFI_PASSWORD "YOUR_PASSWORD"
+    ```
+2.  The UI will automatically display the local IP address once the connection is established.
 
 ## Critical Technical Resolutions
 
