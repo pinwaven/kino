@@ -2,9 +2,25 @@
 #include "lvgl.h"
 #include "assets/waven_logo_svg.h"
 #include "assets/animated_dot_svg.h"
+#include "../hal/WiFi.h"
 #include <stdlib.h>
 
 static lv_obj_t * text_circle;
+static lv_obj_t * debug_label;
+
+static void wifi_timer_cb(lv_timer_t * timer) {
+  wifi_hal_status_t status = hal_wifi_get_status();
+  if (status == WIFI_STATUS_CONNECTED) {
+    String ip = hal_wifi_get_ip();
+    lv_label_set_text_fmt(debug_label, "IP: %s", ip.c_str());
+  } else if (status == WIFI_STATUS_CONNECTING) {
+    lv_label_set_text(debug_label, "WiFi: Connecting...");
+  } else if (status == WIFI_STATUS_ERROR) {
+    lv_label_set_text(debug_label, "WiFi: Error");
+  } else {
+    lv_label_set_text(debug_label, "WiFi: Disconnected");
+  }
+}
 
 void ui_init() {
   lv_obj_t * screen = lv_screen_active();
@@ -66,7 +82,10 @@ void ui_init() {
     lv_obj_set_style_border_color(text_circle, lv_color_hex(rand() % 0xFFFFFF), 0);
   }, LV_EVENT_CLICKED, NULL);
 
-  lv_obj_t * debug_label = lv_label_create(screen);
-  lv_label_set_text(debug_label, "Kino Biomarker Analyzer");
+  debug_label = lv_label_create(screen);
+  lv_label_set_text(debug_label, "Initializing WiFi...");
   lv_obj_align(debug_label, LV_ALIGN_BOTTOM_MID, 0, -40);
+
+  // Create a timer to update WiFi status
+  lv_timer_create(wifi_timer_cb, 1000, NULL);
 }

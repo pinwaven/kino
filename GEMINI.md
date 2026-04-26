@@ -66,17 +66,16 @@ kino/
 ```
 
 ## Build & Upload Instructions
-This project is standalone.
+This project requires specific board settings for the 16MB Flash and OPI PSRAM.
 
 ### 1. Compile
 ```bash
-arduino-cli compile --fqbn esp32:esp32:esp32s3 --libraries libraries kino.ino
+arduino-cli compile --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,FlashMode=dio" --libraries libraries kino.ino
 ```
 
 ### 2. Upload
-Replace `/dev/cu.usbmodem14201` with your actual device port.
 ```bash
-arduino-cli upload -p /dev/cu.usbmodem14201 --fqbn esp32:esp32:esp32s3 kino.ino
+arduino-cli upload -p /dev/cu.usbmodem14201 --fqbn "esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi,FlashMode=dio" kino.ino
 ```
 
 **Required Board Settings:**
