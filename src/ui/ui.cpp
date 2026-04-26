@@ -10,6 +10,12 @@ static void wifi_timer_cb(lv_timer_t * timer) {
   if (status == WIFI_STATUS_CONNECTED) {
     String ip = hal_wifi_get_ip();
     lv_label_set_text_fmt(wifi_label, "IP: %s", ip.c_str());
+    static bool printed = false;
+    if (!printed) {
+      Serial.print("WiFi Connected. IP: ");
+      Serial.println(ip);
+      printed = true;
+    }
   } else if (status == WIFI_STATUS_CONNECTING) {
     lv_label_set_text(wifi_label, "WiFi: Connecting...");
   } else if (status == WIFI_STATUS_ERROR) {
