@@ -1,0 +1,15 @@
+# Operating System
+.DS_Store
+Thumbs.db
+
+# Build Artifacts
+build/
+*.bin
+*.elf
+*.hex
+
+# LVGL Legacy Backup
+libraries/lvgl/v8_backup/
+
+# Local configuration
+src/hal/local_config.h
