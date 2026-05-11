@@ -1,0 +1,1 @@
+/home/marco/enterprises/MCU/STM32/kino/kino_pre/docs/stm32_esp32_interface.md
