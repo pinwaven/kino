@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -22,6 +23,7 @@
 #define BLE_CMD_QUEUE_LEN 4
 #define BLE_CMD_MAX_LEN 31
 #define MOTOR_ACTION_DRAIN_MS 180
+#define BLE_MIN_DMA_HEAP_BEFORE_START 16384
 
 static const char *TAG = "BLE_CONTROL";
 static const ble_uuid16_t g_service_uuid = BLE_UUID16_INIT(0xFFE0);
@@ -83,6 +85,18 @@ static void set_state_result(const char *cmd, const char *result) {
         }
         xSemaphoreGive(g_state_mutex);
     }
+}
+
+void ble_control_log_heap(const char *tag) {
+    ESP_LOGI(TAG,
+             "%s heap: dma=%u/%u internal=%u/%u psram=%u/%u",
+             tag ? tag : "BLE",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM));
 }
 
 static void set_flag_state(bool active, bool advertising, bool connected, bool notify_enabled) {
@@ -532,9 +546,11 @@ static esp_err_t ble_control_init_once(void) {
 
 esp_err_t ble_control_set_active(bool active) {
     if (!active) {
+        ble_control_log_heap("before BLE stop");
         if (!get_initialized()) {
             set_flag_state(false, false, false, false);
             set_state_result(NULL, "BLE: off");
+            ble_control_log_heap("after BLE stop");
             return ESP_OK;
         }
 
@@ -547,12 +563,24 @@ esp_err_t ble_control_set_active(bool active) {
         }
         set_flag_state(false, false, false, false);
         set_state_result(NULL, "BLE: off");
+        ble_control_log_heap("after BLE stop");
         return ESP_OK;
+    }
+
+    ble_control_log_heap("before BLE start");
+    size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA);
+    if (dma_free < BLE_MIN_DMA_HEAP_BEFORE_START) {
+        char err_text[64];
+        snprintf(err_text, sizeof(err_text), "ERR: low DMA heap %u", (unsigned)dma_free);
+        set_state_result(NULL, err_text);
+        ESP_LOGE(TAG, "%s", err_text);
+        return ESP_ERR_NO_MEM;
     }
 
     esp_err_t err = ble_control_init_once();
     if (err != ESP_OK) {
         set_state_result(NULL, "BLE: init failed");
+        ble_control_log_heap("after BLE init failed");
         return err;
     }
 
@@ -562,6 +590,7 @@ esp_err_t ble_control_set_active(bool active) {
     if (g_host_synced && g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
         start_advertising();
     }
+    ble_control_log_heap("after BLE start");
     return ESP_OK;
 }
 

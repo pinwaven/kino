@@ -18,5 +18,6 @@ typedef struct {
 
 esp_err_t ble_control_set_active(bool active);
 void ble_control_get_state(ble_control_state_t *out_state);
+void ble_control_log_heap(const char *tag);
 
 #endif // BLE_CONTROL_H

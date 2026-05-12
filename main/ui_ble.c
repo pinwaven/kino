@@ -11,6 +11,13 @@ static lv_timer_t *ble_timer;
 static bool ble_page_active;
 static bool ble_starting;
 
+static void set_ble_refresh_mode(bool active) {
+    lv_timer_t *refr = lv_display_get_refr_timer(NULL);
+    if (refr) {
+        lv_timer_set_period(refr, active ? 500 : 16);
+    }
+}
+
 static void update_labels(void) {
     ble_control_state_t state;
     ble_control_get_state(&state);
@@ -32,7 +39,10 @@ static void ble_timer_cb(lv_timer_t *timer) {
 
 static void ble_start_task(void *arg) {
     (void)arg;
-    ble_control_set_active(true);
+    esp_err_t err = ble_control_set_active(true);
+    if (err != ESP_OK) {
+        set_ble_refresh_mode(false);
+    }
     ble_starting = false;
     vTaskDelete(NULL);
 }
@@ -50,6 +60,7 @@ static void start_btn_event_cb(lv_event_t *e) {
     }
 
     ble_starting = true;
+    set_ble_refresh_mode(true);
     if (result_label) {
         lv_label_set_text(result_label, "CMD: --\nBLE: starting");
     }
@@ -65,12 +76,14 @@ static void start_btn_event_cb(lv_event_t *e) {
 static void stop_btn_event_cb(lv_event_t *e) {
     (void)e;
     ble_control_set_active(false);
+    set_ble_refresh_mode(false);
     update_labels();
 }
 
 void ui_ble_set_active(bool active) {
     ble_page_active = active;
     if (active) {
+        set_ble_refresh_mode(true);
         if (ble_timer) {
             lv_timer_resume(ble_timer);
             lv_timer_ready(ble_timer);
@@ -80,6 +93,7 @@ void ui_ble_set_active(bool active) {
             lv_timer_pause(ble_timer);
         }
         ble_control_set_active(false);
+        set_ble_refresh_mode(false);
     }
 }
 
