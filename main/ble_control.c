@@ -33,6 +33,7 @@ typedef struct {
 } ble_cmd_msg_t;
 
 static SemaphoreHandle_t g_state_mutex;
+static SemaphoreHandle_t g_init_mutex;
 static QueueHandle_t g_cmd_queue;
 static bool g_host_synced;
 static uint8_t g_own_addr_type;
@@ -448,9 +449,26 @@ static esp_err_t ble_control_init_once(void) {
         return ESP_OK;
     }
 
+    if (!g_init_mutex) {
+        g_init_mutex = xSemaphoreCreateMutex();
+        if (!g_init_mutex) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (xSemaphoreTake(g_init_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (get_initialized()) {
+        xSemaphoreGive(g_init_mutex);
+        return ESP_OK;
+    }
+
     if (!g_state_mutex) {
         g_state_mutex = xSemaphoreCreateMutex();
         if (!g_state_mutex) {
+            xSemaphoreGive(g_init_mutex);
             return ESP_ERR_NO_MEM;
         }
     }
@@ -458,6 +476,7 @@ static esp_err_t ble_control_init_once(void) {
     if (!g_cmd_queue) {
         g_cmd_queue = xQueueCreate(BLE_CMD_QUEUE_LEN, sizeof(ble_cmd_msg_t));
         if (!g_cmd_queue) {
+            xSemaphoreGive(g_init_mutex);
             return ESP_ERR_NO_MEM;
         }
     }
@@ -465,6 +484,7 @@ static esp_err_t ble_control_init_once(void) {
     esp_err_t err = nimble_port_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "nimble init failed: %s", esp_err_to_name(err));
+        xSemaphoreGive(g_init_mutex);
         return err;
     }
 
@@ -475,15 +495,18 @@ static esp_err_t ble_control_init_once(void) {
 
     int rc = ble_gatts_count_cfg(g_gatt_svcs);
     if (rc != 0) {
+        xSemaphoreGive(g_init_mutex);
         return ESP_FAIL;
     }
     rc = ble_gatts_add_svcs(g_gatt_svcs);
     if (rc != 0) {
+        xSemaphoreGive(g_init_mutex);
         return ESP_FAIL;
     }
 
     BaseType_t task_ok = xTaskCreate(cmd_worker_task, "ble_cmd_worker", 4096, NULL, 5, NULL);
     if (task_ok != pdPASS) {
+        xSemaphoreGive(g_init_mutex);
         return ESP_ERR_NO_MEM;
     }
 
@@ -494,6 +517,7 @@ static esp_err_t ble_control_init_once(void) {
         xSemaphoreGive(g_state_mutex);
     }
     set_state_result(NULL, "BLE: ready");
+    xSemaphoreGive(g_init_mutex);
     return ESP_OK;
 }
 
