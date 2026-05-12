@@ -42,7 +42,7 @@ static void start_btn_event_cb(lv_event_t *e) {
     ble_control_state_t state;
     ble_control_get_state(&state);
 
-    if (ble_starting || state.initialized || state.advertising || state.connected) {
+    if (ble_starting || state.active || state.advertising || state.connected) {
         if (result_label) {
             lv_label_set_text(result_label, "CMD: --\nBLE: already running");
         }
