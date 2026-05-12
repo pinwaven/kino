@@ -12,6 +12,7 @@ static lv_obj_t *overlay;
 
 static const char *TAG = "UI_MANAGER";
 static bool is_dimmed = false;
+static bool allow_auto_dim = true;
 static const int BRIGHTNESS_NORMAL = 66;
 static const int BRIGHTNESS_DIMMED = 20;
 static const uint32_t INACTIVITY_TIMEOUT_MS = 10000;
@@ -33,6 +34,17 @@ static void overlay_event_cb(lv_event_t * e) {
 static void inactivity_timer_cb(lv_timer_t * t) {
     uint32_t inactive_time = lv_display_get_inactive_time(NULL);
 
+    if (!allow_auto_dim) {
+        if (is_dimmed) {
+            bsp_display_brightness_set(BRIGHTNESS_NORMAL);
+            lv_timer_set_period(lv_display_get_refr_timer(NULL), REFR_PERIOD_NORMAL);
+            is_dimmed = false;
+            lv_obj_add_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_display_trigger_activity(NULL);
+        return;
+    }
+
     if (inactive_time >= INACTIVITY_TIMEOUT_MS) {
         if (!is_dimmed) {
             bsp_display_brightness_set(BRIGHTNESS_DIMMED);
@@ -46,6 +58,15 @@ static void inactivity_timer_cb(lv_timer_t * t) {
 }
 
 static void update_active_page(lv_obj_t *active_tile) {
+    allow_auto_dim = active_tile != t5;
+    if (!allow_auto_dim && is_dimmed) {
+        bsp_display_brightness_set(BRIGHTNESS_NORMAL);
+        lv_timer_set_period(lv_display_get_refr_timer(NULL), REFR_PERIOD_NORMAL);
+        is_dimmed = false;
+        lv_obj_add_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+        lv_display_trigger_activity(NULL);
+    }
+
     ui_standby_set_active(active_tile == t1);
     ui_motor_set_active(active_tile == t2);
     ui_nfc_set_active(active_tile == t2);
