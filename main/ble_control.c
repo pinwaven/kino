@@ -34,7 +34,6 @@ typedef struct {
 
 static SemaphoreHandle_t g_state_mutex;
 static SemaphoreHandle_t g_init_mutex;
-static SemaphoreHandle_t g_active_mutex;
 static QueueHandle_t g_cmd_queue;
 static bool g_host_synced;
 static uint8_t g_own_addr_type;
@@ -538,22 +537,10 @@ static esp_err_t ble_control_init_once(void) {
 }
 
 esp_err_t ble_control_set_active(bool active) {
-    if (!g_active_mutex) {
-        g_active_mutex = xSemaphoreCreateMutex();
-        if (!g_active_mutex) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    if (xSemaphoreTake(g_active_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
-
     if (!active) {
         if (!get_initialized()) {
             set_flag_state(false, false, false, false);
             set_state_result(NULL, "BLE: off");
-            xSemaphoreGive(g_active_mutex);
             return ESP_OK;
         }
 
@@ -561,22 +548,17 @@ esp_err_t ble_control_set_active(bool active) {
             ble_gap_adv_stop();
             if (g_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
                 ble_gap_terminate(g_conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-                set_flag_state(false, false, true, false);
-                set_state_result(NULL, "BLE: disconnecting");
-                xSemaphoreGive(g_active_mutex);
-                return ESP_OK;
+                g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
             }
         }
         set_flag_state(false, false, false, false);
         set_state_result(NULL, "BLE: off");
-        xSemaphoreGive(g_active_mutex);
         return ESP_OK;
     }
 
     esp_err_t err = ble_control_init_once();
     if (err != ESP_OK) {
         set_state_result(NULL, "BLE: init failed");
-        xSemaphoreGive(g_active_mutex);
         return err;
     }
 
@@ -586,7 +568,6 @@ esp_err_t ble_control_set_active(bool active) {
     if (g_host_synced && g_conn_handle == BLE_HS_CONN_HANDLE_NONE) {
         start_advertising();
     }
-    xSemaphoreGive(g_active_mutex);
     return ESP_OK;
 }
 
