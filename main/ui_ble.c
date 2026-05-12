@@ -149,7 +149,7 @@ void ui_ble_init(lv_obj_t *tile) {
     lv_label_set_text(result_label, "CMD: --\nTap START");
 
     lv_obj_t *commands = lv_label_create(tile);
-    lv_label_set_text(commands, "open close homing stop nfc status");
+    lv_label_set_text(commands, "open close homing stop nfc status hi");
     lv_obj_set_width(commands, 360);
     lv_obj_set_style_text_align(commands, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(commands, &lv_font_montserrat_12, 0);

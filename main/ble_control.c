@@ -153,6 +153,8 @@ static void normalize_command(char *cmd) {
         strlcpy(cmd, "nfc", BLE_CMD_MAX_LEN + 1);
     } else if (strcmp(cmd, "6") == 0 || strcmp(cmd, "06") == 0 || strcmp(cmd, "0x06") == 0) {
         strlcpy(cmd, "status", BLE_CMD_MAX_LEN + 1);
+    } else if (strcmp(cmd, "7") == 0 || strcmp(cmd, "07") == 0 || strcmp(cmd, "0x07") == 0) {
+        strlcpy(cmd, "hi", BLE_CMD_MAX_LEN + 1);
     }
 }
 
@@ -243,13 +245,26 @@ static void cmd_worker_task(void *arg) {
         }
 
         if (strcmp(cmd, "help") == 0) {
-            set_state_result(cmd, "CMDS: open close homing stop nfc status; hex 01-06");
+            set_state_result(cmd, "CMDS: open close homing stop nfc status hi; hex 01-07");
             notify_status();
             continue;
         }
 
         if (strcmp(cmd, "status") == 0) {
             set_state_result(cmd, "OK: status");
+            notify_status();
+            continue;
+        }
+
+        if (strcmp(cmd, "hi") == 0) {
+            esp_err_t err = stm32_cmd_send_action(CMD_HI, NULL, 0);
+            if (err == ESP_OK) {
+                set_state_result(cmd, "OK: hi sent");
+            } else {
+                char err_text[48];
+                snprintf(err_text, sizeof(err_text), "ERR: %s", esp_err_to_name(err));
+                set_state_result(cmd, err_text);
+            }
             notify_status();
             continue;
         }
