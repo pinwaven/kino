@@ -424,19 +424,13 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
 
     case BLE_GAP_EVENT_DISCONNECT:
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-        set_flag_state(get_active(), false, false, false);
+        set_flag_state(false, false, false, false);
         set_state_result(NULL, "BLE: disconnected");
         ESP_LOGI(TAG, "disconnected");
-        if (get_active()) {
-            start_advertising();
-        }
         break;
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
-        set_flag_state(get_active(), false, false, get_notify_enabled());
-        if (get_active()) {
-            start_advertising();
-        }
+        set_flag_state(false, false, false, get_notify_enabled());
         break;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
