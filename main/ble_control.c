@@ -48,6 +48,7 @@ static int status_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 static int command_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                              struct ble_gatt_access_ctxt *ctxt, void *arg);
 static void start_advertising(void);
+static void str_to_lower_trim(char *s);
 
 static const struct ble_gatt_svc_def g_gatt_svcs[] = {
     {
@@ -136,6 +137,24 @@ static void build_status(char *out, size_t out_len) {
              stm32.motor_status[0] ? stm32.motor_status : "--");
 }
 
+static void normalize_command(char *cmd) {
+    str_to_lower_trim(cmd);
+
+    if (strcmp(cmd, "1") == 0 || strcmp(cmd, "01") == 0 || strcmp(cmd, "0x01") == 0) {
+        strlcpy(cmd, "open", BLE_CMD_MAX_LEN + 1);
+    } else if (strcmp(cmd, "2") == 0 || strcmp(cmd, "02") == 0 || strcmp(cmd, "0x02") == 0) {
+        strlcpy(cmd, "close", BLE_CMD_MAX_LEN + 1);
+    } else if (strcmp(cmd, "3") == 0 || strcmp(cmd, "03") == 0 || strcmp(cmd, "0x03") == 0) {
+        strlcpy(cmd, "homing", BLE_CMD_MAX_LEN + 1);
+    } else if (strcmp(cmd, "4") == 0 || strcmp(cmd, "04") == 0 || strcmp(cmd, "0x04") == 0) {
+        strlcpy(cmd, "stop", BLE_CMD_MAX_LEN + 1);
+    } else if (strcmp(cmd, "5") == 0 || strcmp(cmd, "05") == 0 || strcmp(cmd, "0x05") == 0) {
+        strlcpy(cmd, "nfc", BLE_CMD_MAX_LEN + 1);
+    } else if (strcmp(cmd, "6") == 0 || strcmp(cmd, "06") == 0 || strcmp(cmd, "0x06") == 0) {
+        strlcpy(cmd, "status", BLE_CMD_MAX_LEN + 1);
+    }
+}
+
 static void notify_status(void) {
     char status[192];
     ble_control_state_t state;
@@ -212,7 +231,9 @@ static void cmd_worker_task(void *arg) {
 
         char cmd[BLE_CMD_MAX_LEN + 1];
         strlcpy(cmd, msg.text, sizeof(cmd));
-        str_to_lower_trim(cmd);
+        normalize_command(cmd);
+
+        ESP_LOGI(TAG, "command: %s", cmd);
 
         if (!get_active()) {
             set_state_result(cmd, "ERR: BLE page inactive");
@@ -221,7 +242,7 @@ static void cmd_worker_task(void *arg) {
         }
 
         if (strcmp(cmd, "help") == 0) {
-            set_state_result(cmd, "CMDS: open close homing stop nfc status");
+            set_state_result(cmd, "CMDS: open close homing stop nfc status; hex 01-06");
             notify_status();
             continue;
         }
@@ -249,12 +270,15 @@ static void cmd_worker_task(void *arg) {
         esp_err_t err = send_motor_command(cmd);
         if (err == ESP_OK) {
             set_state_result(cmd, "OK");
+            ESP_LOGI(TAG, "command %s done", cmd);
         } else if (err == ESP_ERR_NOT_SUPPORTED) {
             set_state_result(cmd, "ERR: unknown command");
+            ESP_LOGW(TAG, "unknown command: %s", cmd);
         } else {
             char err_text[48];
             snprintf(err_text, sizeof(err_text), "ERR: %s", esp_err_to_name(err));
             set_state_result(cmd, err_text);
+            ESP_LOGW(TAG, "command %s failed: %s", cmd, esp_err_to_name(err));
         }
         notify_status();
     }
@@ -309,10 +333,19 @@ static int command_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     }
     msg.text[copied] = '\0';
 
+    if (copied == 1 && (uint8_t)msg.text[0] >= 1 && (uint8_t)msg.text[0] <= 6) {
+        snprintf(msg.text, sizeof(msg.text), "%u", (unsigned)(uint8_t)msg.text[0]);
+    }
+
+    ESP_LOGI(TAG, "write FFE1: %s", msg.text[0] ? msg.text : "<empty>");
+    set_state_result(msg.text[0] ? msg.text : "--", "RX: queued");
+
     if (xQueueSend(g_cmd_queue, &msg, 0) != pdTRUE) {
+        set_state_result(msg.text[0] ? msg.text : "--", "ERR: command queue full");
         return BLE_ATT_ERR_INSUFFICIENT_RES;
     }
 
+    notify_status();
     return 0;
 }
 
@@ -350,6 +383,7 @@ static void start_advertising(void) {
     if (rc == 0) {
         set_flag_state(true, true, false, get_notify_enabled());
         set_state_result(NULL, "BLE: advertising");
+        ESP_LOGI(TAG, "advertising started as %s", BLE_CONTROL_DEVICE_NAME);
     } else {
         ESP_LOGE(TAG, "adv start failed: %d", rc);
         set_state_result(NULL, "BLE: adv start failed");
@@ -365,6 +399,8 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
             g_conn_handle = event->connect.conn_handle;
             set_flag_state(true, false, true, get_notify_enabled());
             set_state_result(NULL, "BLE: connected");
+            ESP_LOGI(TAG, "connected");
+            notify_status();
         } else if (get_active()) {
             start_advertising();
         }
@@ -374,6 +410,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         set_flag_state(get_active(), false, false, false);
         set_state_result(NULL, "BLE: disconnected");
+        ESP_LOGI(TAG, "disconnected");
         if (get_active()) {
             start_advertising();
         }
@@ -392,6 +429,10 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
             ble_control_state_t state;
             ble_control_get_state(&state);
             set_flag_state(state.active, state.advertising, state.connected, notify);
+            ESP_LOGI(TAG, "notify %s", notify ? "enabled" : "disabled");
+            if (notify) {
+                notify_status();
+            }
         }
         break;
 
