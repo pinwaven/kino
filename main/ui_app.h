@@ -18,5 +18,7 @@ void ui_nfc_init_compact(lv_obj_t *parent);
 void ui_nfc_set_active(bool active);
 void ui_sys_stats_init(lv_obj_t *tile);
 void ui_sys_stats_set_active(bool active);
+void ui_ble_init(lv_obj_t *tile);
+void ui_ble_set_active(bool active);
 
 #endif // UI_APP_H
