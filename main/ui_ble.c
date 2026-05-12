@@ -1,12 +1,15 @@
 #include "ui_app.h"
 #include "ble_control.h"
 #include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <stdio.h>
 
 static lv_obj_t *state_label;
 static lv_obj_t *result_label;
 static lv_timer_t *ble_timer;
 static bool ble_page_active;
+static bool ble_starting;
 
 static void update_labels(void) {
     ble_control_state_t state;
@@ -27,13 +30,41 @@ static void ble_timer_cb(lv_timer_t *timer) {
     update_labels();
 }
 
+static void ble_start_task(void *arg) {
+    (void)arg;
+    ble_control_set_active(true);
+    ble_starting = false;
+    vTaskDelete(NULL);
+}
+
+static void start_btn_event_cb(lv_event_t *e) {
+    (void)e;
+    if (ble_starting) {
+        return;
+    }
+
+    ble_starting = true;
+    if (result_label) {
+        lv_label_set_text(result_label, "CMD: --\nBLE: starting");
+    }
+
+    if (xTaskCreate(ble_start_task, "ble_start", 4096, NULL, 5, NULL) != pdPASS) {
+        ble_starting = false;
+        if (result_label) {
+            lv_label_set_text(result_label, "CMD: --\nBLE: start task failed");
+        }
+    }
+}
+
+static void stop_btn_event_cb(lv_event_t *e) {
+    (void)e;
+    ble_control_set_active(false);
+    update_labels();
+}
+
 void ui_ble_set_active(bool active) {
     ble_page_active = active;
     if (active) {
-        esp_err_t err = ble_control_set_active(true);
-        if (err != ESP_OK && result_label) {
-            lv_label_set_text_fmt(result_label, "BLE init error:\n%s", esp_err_to_name(err));
-        }
         if (ble_timer) {
             lv_timer_resume(ble_timer);
             lv_timer_ready(ble_timer);
@@ -70,13 +101,37 @@ void ui_ble_init(lv_obj_t *tile) {
     lv_obj_align(state_label, LV_ALIGN_CENTER, 0, -28);
     lv_label_set_text(state_label, "BLE: OFF");
 
+    lv_obj_t *start_btn = lv_button_create(tile);
+    lv_obj_set_size(start_btn, 120, 46);
+    lv_obj_align(start_btn, LV_ALIGN_CENTER, -70, 30);
+    lv_obj_set_style_bg_color(start_btn, lv_color_hex(0x27AE60), 0);
+    lv_obj_set_style_radius(start_btn, 23, 0);
+    lv_obj_add_event_cb(start_btn, start_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *start_label = lv_label_create(start_btn);
+    lv_label_set_text(start_label, "START");
+    lv_obj_set_style_text_font(start_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(start_label);
+
+    lv_obj_t *stop_btn = lv_button_create(tile);
+    lv_obj_set_size(stop_btn, 120, 46);
+    lv_obj_align(stop_btn, LV_ALIGN_CENTER, 70, 30);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_hex(0xC0392B), 0);
+    lv_obj_set_style_radius(stop_btn, 23, 0);
+    lv_obj_add_event_cb(stop_btn, stop_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *stop_label = lv_label_create(stop_btn);
+    lv_label_set_text(stop_label, "STOP");
+    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(stop_label);
+
     lv_obj_t *svc = lv_label_create(tile);
     lv_label_set_text(svc, "SVC FFE0  WRITE FFE1  READ/NOTIFY FFE2");
     lv_obj_set_width(svc, 360);
     lv_obj_set_style_text_align(svc, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(svc, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(svc, lv_color_hex(0x888888), 0);
-    lv_obj_align(svc, LV_ALIGN_CENTER, 0, 16);
+    lv_obj_align(svc, LV_ALIGN_CENTER, 0, 84);
 
     result_label = lv_label_create(tile);
     lv_obj_set_width(result_label, 340);
@@ -85,7 +140,7 @@ void ui_ble_init(lv_obj_t *tile) {
     lv_obj_set_style_text_color(result_label, lv_color_hex(0xFFFFFF), 0);
     lv_label_set_long_mode(result_label, LV_LABEL_LONG_WRAP);
     lv_obj_align(result_label, LV_ALIGN_BOTTOM_MID, 0, -70);
-    lv_label_set_text(result_label, "CMD: --\nBLE: off");
+    lv_label_set_text(result_label, "CMD: --\nTap START");
 
     lv_obj_t *commands = lv_label_create(tile);
     lv_label_set_text(commands, "open close homing stop nfc status");
