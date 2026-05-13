@@ -12,8 +12,10 @@ typedef struct {
     bool advertising;
     bool connected;
     bool notify_enabled;
+    bool phy_2m;
     char last_command[32];
     char last_result[96];
+    char phy_status[16];
 } ble_control_state_t;
 
 esp_err_t ble_control_set_active(bool active);

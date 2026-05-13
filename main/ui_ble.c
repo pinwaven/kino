@@ -27,9 +27,10 @@ static void update_labels(void) {
                          state.initialized ? "READY" : "OFF";
 
     lv_label_set_text_fmt(state_label, "BLE: %s", status);
-    lv_label_set_text_fmt(result_label, "CMD: %s\n%s",
+    lv_label_set_text_fmt(result_label, "CMD: %s\n%s\n%s",
                           state.last_command[0] ? state.last_command : "--",
-                          state.last_result[0] ? state.last_result : "--");
+                          state.last_result[0] ? state.last_result : "--",
+                          state.phy_status[0] ? state.phy_status : "PHY: --");
 }
 
 static void ble_timer_cb(lv_timer_t *timer) {

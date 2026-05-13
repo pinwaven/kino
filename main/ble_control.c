@@ -43,6 +43,7 @@ static uint16_t g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static uint16_t g_status_val_handle;
 static ble_control_state_t g_state = {
     .last_result = "BLE: off",
+    .phy_status = "PHY: --",
 };
 
 static int gap_event_cb(struct ble_gap_event *event, void *arg);
@@ -82,6 +83,16 @@ static void set_state_result(const char *cmd, const char *result) {
         }
         if (result) {
             strlcpy(g_state.last_result, result, sizeof(g_state.last_result));
+        }
+        xSemaphoreGive(g_state_mutex);
+    }
+}
+
+static void set_phy_status(const char *status, bool phy_2m) {
+    if (g_state_mutex && xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        g_state.phy_2m = phy_2m;
+        if (status) {
+            strlcpy(g_state.phy_status, status, sizeof(g_state.phy_status));
         }
         xSemaphoreGive(g_state_mutex);
     }
@@ -143,13 +154,48 @@ static void build_status(char *out, size_t out_len) {
     ble_control_get_state(&state);
     stm32_get_current_state(&stm32);
     snprintf(out, out_len,
-             "BLE:%s%s\nCMD:%s\n%s\nACT:%s\nSTS:%s",
+             "BLE:%s%s\nCMD:%s\n%s\n%s\nACT:%s\nSTS:%s",
              state.connected ? "connected" : (state.advertising ? "advertising" : "off"),
              state.active ? "" : " inactive",
              state.last_command[0] ? state.last_command : "--",
              state.last_result[0] ? state.last_result : "--",
+             state.phy_status[0] ? state.phy_status : "PHY: --",
              stm32.motor_action[0] ? stm32.motor_action : "--",
              stm32.motor_status[0] ? stm32.motor_status : "--");
+}
+
+static const char *phy_name(uint8_t phy) {
+    switch (phy) {
+    case BLE_GAP_LE_PHY_1M:
+        return "1M";
+    case BLE_GAP_LE_PHY_2M:
+        return "2M";
+    case BLE_GAP_LE_PHY_CODED:
+        return "CODED";
+    default:
+        return "--";
+    }
+}
+
+static void request_2m_phy(uint16_t conn_handle) {
+#if CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT && CONFIG_BT_NIMBLE_LL_CFG_FEAT_LE_2M_PHY
+    int rc = ble_gap_set_prefered_le_phy(conn_handle,
+                                         BLE_GAP_LE_PHY_2M_MASK,
+                                         BLE_GAP_LE_PHY_2M_MASK,
+                                         0);
+    if (rc == 0) {
+        set_phy_status("PHY: pending", false);
+        ESP_LOGI(TAG, "2M PHY update requested");
+    } else {
+        char text[16];
+        snprintf(text, sizeof(text), "PHY: err %d", rc);
+        set_phy_status(text, false);
+        ESP_LOGW(TAG, "2M PHY request failed: %d", rc);
+    }
+#else
+    (void)conn_handle;
+    set_phy_status("PHY: off", false);
+#endif
 }
 
 static void normalize_command(char *cmd) {
@@ -329,6 +375,15 @@ static void on_sync(void) {
     }
 
     g_host_synced = true;
+#if CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT && CONFIG_BT_NIMBLE_LL_CFG_FEAT_LE_2M_PHY
+    rc = ble_gap_set_prefered_default_le_phy(BLE_GAP_LE_PHY_2M_MASK, BLE_GAP_LE_PHY_2M_MASK);
+    if (rc == 0) {
+        set_phy_status("PHY: prefer 2M", false);
+    } else {
+        ESP_LOGW(TAG, "default 2M PHY preference failed: %d", rc);
+        set_phy_status("PHY: pref err", false);
+    }
+#endif
     if (get_active()) {
         start_advertising();
     }
@@ -437,7 +492,9 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
             g_conn_handle = event->connect.conn_handle;
             set_flag_state(true, false, true, get_notify_enabled());
             set_state_result(NULL, "BLE: connected");
+            set_phy_status("PHY: pending", false);
             ESP_LOGI(TAG, "connected");
+            request_2m_phy(g_conn_handle);
             notify_status();
         } else if (get_active()) {
             start_advertising();
@@ -447,9 +504,32 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg) {
     case BLE_GAP_EVENT_DISCONNECT:
         g_conn_handle = BLE_HS_CONN_HANDLE_NONE;
         set_flag_state(false, false, false, false);
+        set_phy_status("PHY: --", false);
         set_state_result(NULL, "BLE: disconnected");
         ESP_LOGI(TAG, "disconnected");
         break;
+
+    case BLE_GAP_EVENT_PHY_UPDATE_COMPLETE: {
+        char text[16];
+        bool is_2m = event->phy_updated.status == 0 &&
+                     event->phy_updated.tx_phy == BLE_GAP_LE_PHY_2M &&
+                     event->phy_updated.rx_phy == BLE_GAP_LE_PHY_2M;
+
+        if (event->phy_updated.status == 0) {
+            snprintf(text, sizeof(text), "PHY: %s/%s",
+                     phy_name(event->phy_updated.tx_phy),
+                     phy_name(event->phy_updated.rx_phy));
+            ESP_LOGI(TAG, "PHY updated: tx=%s rx=%s",
+                     phy_name(event->phy_updated.tx_phy),
+                     phy_name(event->phy_updated.rx_phy));
+        } else {
+            snprintf(text, sizeof(text), "PHY: err %d", event->phy_updated.status);
+            ESP_LOGW(TAG, "PHY update failed: %d", event->phy_updated.status);
+        }
+        set_phy_status(is_2m ? "PHY: 2M" : text, is_2m);
+        notify_status();
+        break;
+    }
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
         set_flag_state(false, false, false, get_notify_enabled());
