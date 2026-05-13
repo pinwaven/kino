@@ -363,7 +363,7 @@ static int command_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     }
     msg.text[copied] = '\0';
 
-    if (copied == 1 && (uint8_t)msg.text[0] >= 1 && (uint8_t)msg.text[0] <= 6) {
+    if (copied == 1 && (uint8_t)msg.text[0] >= 1 && (uint8_t)msg.text[0] <= 7) {
         snprintf(msg.text, sizeof(msg.text), "%u", (unsigned)(uint8_t)msg.text[0]);
     }
 
@@ -388,7 +388,11 @@ static void start_advertising(void) {
         return;
     }
 
-    ble_gap_adv_stop();
+    if (ble_gap_adv_active()) {
+        set_flag_state(true, true, false, get_notify_enabled());
+        set_state_result(NULL, "BLE: advertising");
+        return;
+    }
 
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
     fields.tx_pwr_lvl_is_present = 1;
@@ -414,6 +418,10 @@ static void start_advertising(void) {
         set_flag_state(true, true, false, get_notify_enabled());
         set_state_result(NULL, "BLE: advertising");
         ESP_LOGI(TAG, "advertising started as %s", BLE_CONTROL_DEVICE_NAME);
+    } else if (rc == BLE_HS_EBUSY || rc == BLE_HS_EALREADY) {
+        set_flag_state(true, true, false, get_notify_enabled());
+        set_state_result(NULL, "BLE: advertising");
+        ESP_LOGW(TAG, "advertising already active or busy: %d", rc);
     } else {
         ESP_LOGE(TAG, "adv start failed: %d", rc);
         set_state_result(NULL, "BLE: adv start failed");
