@@ -14,7 +14,7 @@ static bool ble_starting;
 static void set_ble_refresh_mode(bool active) {
     lv_timer_t *refr = lv_display_get_refr_timer(NULL);
     if (refr) {
-        lv_timer_set_period(refr, active ? 500 : 16);
+        lv_timer_set_period(refr, active ? 75 : 16);
     }
 }
 
