@@ -75,13 +75,19 @@ void app_main(void)
         return;
     }
     ESP_LOGI(TAG, "display ready");
+    vTaskDelay(pdMS_TO_TICKS(50));
 
+    ESP_LOGI(TAG, "display lock");
     bsp_display_lock(-1);
 
+    ESP_LOGI(TAG, "brightness set");
     bsp_display_brightness_set(50);
 
     // 初始化自定义 UI
+    ESP_LOGI(TAG, "ui init");
     ui_init();
+    ESP_LOGI(TAG, "ui ready");
 
     bsp_display_unlock();
+    ESP_LOGI(TAG, "app main done");
 }
