@@ -11,6 +11,8 @@ static lv_timer_t *ble_timer;
 static bool ble_page_active;
 static bool ble_starting;
 
+#define BLE_UI_FONT (&lv_font_source_han_sans_sc_14_cjk)
+
 static void set_ble_refresh_mode(bool active) {
     lv_timer_t *refr = lv_display_get_refr_timer(NULL);
     if (refr) {
@@ -22,12 +24,12 @@ static void update_labels(void) {
     ble_control_state_t state;
     ble_control_get_state(&state);
 
-    const char *status = state.connected ? "CONNECTED" :
-                         state.advertising ? "ADVERTISING" :
-                         state.initialized ? "READY" : "OFF";
+    const char *status = state.connected ? "已接" :
+                         state.advertising ? "等待" :
+                         state.initialized ? "可用" : "停止";
 
-    lv_label_set_text_fmt(state_label, "BLE: %s", status);
-    lv_label_set_text_fmt(result_label, "CMD: %s\n%s\n%s",
+    lv_label_set_text_fmt(state_label, "BT: %s", status);
+    lv_label_set_text_fmt(result_label, "命令: %s\n%s\n%s",
                           state.last_command[0] ? state.last_command : "--",
                           state.last_result[0] ? state.last_result : "--",
                           state.phy_status[0] ? state.phy_status : "PHY: --");
@@ -55,7 +57,7 @@ static void start_btn_event_cb(lv_event_t *e) {
 
     if (ble_starting || state.active || state.advertising || state.connected) {
         if (result_label) {
-            lv_label_set_text(result_label, "CMD: --\nBLE: already running");
+            lv_label_set_text(result_label, "命令: --\nBT: 已工作");
         }
         return;
     }
@@ -63,13 +65,13 @@ static void start_btn_event_cb(lv_event_t *e) {
     ble_starting = true;
     set_ble_refresh_mode(true);
     if (result_label) {
-        lv_label_set_text(result_label, "CMD: --\nBLE: starting");
+        lv_label_set_text(result_label, "命令: --\nBT: 起动中");
     }
 
     if (xTaskCreate(ble_start_task, "ble_start", 4096, NULL, 5, NULL) != pdPASS) {
         ble_starting = false;
         if (result_label) {
-            lv_label_set_text(result_label, "CMD: --\nBLE: start task failed");
+            lv_label_set_text(result_label, "命令: --\nBT: 起动ERR");
         }
     }
 }
@@ -103,8 +105,8 @@ void ui_ble_init(lv_obj_t *tile) {
     lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *title = lv_label_create(tile);
-    lv_label_set_text(title, "BLE");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_label_set_text(title, "BT控制");
+    lv_obj_set_style_text_font(title, BLE_UI_FONT, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 54);
 
@@ -117,10 +119,10 @@ void ui_ble_init(lv_obj_t *tile) {
     state_label = lv_label_create(tile);
     lv_obj_set_width(state_label, 320);
     lv_obj_set_style_text_align(state_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(state_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_font(state_label, BLE_UI_FONT, 0);
     lv_obj_set_style_text_color(state_label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_align(state_label, LV_ALIGN_CENTER, 0, -28);
-    lv_label_set_text(state_label, "BLE: OFF");
+    lv_label_set_text(state_label, "BT: 停止");
 
     lv_obj_t *start_btn = lv_button_create(tile);
     lv_obj_set_size(start_btn, 120, 46);
@@ -130,8 +132,8 @@ void ui_ble_init(lv_obj_t *tile) {
     lv_obj_add_event_cb(start_btn, start_btn_event_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *start_label = lv_label_create(start_btn);
-    lv_label_set_text(start_label, "START");
-    lv_obj_set_style_text_font(start_label, &lv_font_montserrat_14, 0);
+    lv_label_set_text(start_label, "起动");
+    lv_obj_set_style_text_font(start_label, BLE_UI_FONT, 0);
     lv_obj_center(start_label);
 
     lv_obj_t *stop_btn = lv_button_create(tile);
@@ -142,32 +144,32 @@ void ui_ble_init(lv_obj_t *tile) {
     lv_obj_add_event_cb(stop_btn, stop_btn_event_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *stop_label = lv_label_create(stop_btn);
-    lv_label_set_text(stop_label, "STOP");
-    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_14, 0);
+    lv_label_set_text(stop_label, "停止");
+    lv_obj_set_style_text_font(stop_label, BLE_UI_FONT, 0);
     lv_obj_center(stop_label);
 
     lv_obj_t *svc = lv_label_create(tile);
-    lv_label_set_text(svc, "SVC FFE0  WRITE FFE1  READ/NOTIFY FFE2");
+    lv_label_set_text(svc, "服務 FFE0  寫入 FFE1  通知 FFE2");
     lv_obj_set_width(svc, 360);
     lv_obj_set_style_text_align(svc, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(svc, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(svc, BLE_UI_FONT, 0);
     lv_obj_set_style_text_color(svc, lv_color_hex(0x888888), 0);
     lv_obj_align(svc, LV_ALIGN_CENTER, 0, 84);
 
     result_label = lv_label_create(tile);
     lv_obj_set_width(result_label, 340);
     lv_obj_set_style_text_align(result_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(result_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(result_label, BLE_UI_FONT, 0);
     lv_obj_set_style_text_color(result_label, lv_color_hex(0xFFFFFF), 0);
     lv_label_set_long_mode(result_label, LV_LABEL_LONG_WRAP);
     lv_obj_align(result_label, LV_ALIGN_BOTTOM_MID, 0, -70);
-    lv_label_set_text(result_label, "CMD: --\nTap START");
+    lv_label_set_text(result_label, "命令: --\n點START");
 
     lv_obj_t *commands = lv_label_create(tile);
-    lv_label_set_text(commands, "open close homing stop nfc status hi");
+    lv_label_set_text(commands, "指令 open close homing stop nfc status hi");
     lv_obj_set_width(commands, 360);
     lv_obj_set_style_text_align(commands, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(commands, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(commands, BLE_UI_FONT, 0);
     lv_obj_set_style_text_color(commands, lv_color_hex(0x888888), 0);
     lv_obj_align(commands, LV_ALIGN_BOTTOM_MID, 0, -38);
 
