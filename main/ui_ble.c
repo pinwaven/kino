@@ -11,7 +11,7 @@ static lv_timer_t *ble_timer;
 static bool ble_page_active;
 static bool ble_starting;
 
-#define BLE_UI_FONT (&lv_font_source_han_sans_sc_14_cjk)
+#define BLE_UI_FONT (&lv_font_source_han_sans_sc_16_cjk)
 
 static void set_ble_refresh_mode(bool active) {
     lv_timer_t *refr = lv_display_get_refr_timer(NULL);
