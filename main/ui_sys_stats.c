@@ -4,9 +4,12 @@
 #include "esp_heap_caps.h"
 #include "esp_flash.h"
 #include "esp_timer.h"
+#include "esp_clk_tree.h"
+#include "esp_private/pm_impl.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static lv_obj_t *lbl_heap;
@@ -15,11 +18,147 @@ static lv_obj_t *lbl_uptime;
 static lv_obj_t *lbl_flash;
 static lv_obj_t *lbl_cpu_core0;
 static lv_obj_t *lbl_cpu_core1;
+static lv_obj_t *lbl_cpu_freq;
+static lv_obj_t *lbl_freq_dist;
 static lv_obj_t *spinner; 
 static lv_timer_t *update_timer;
 
 static uint32_t prev_idle_ticks[2] = {0, 0};
 static uint32_t prev_total_ticks = 0;
+typedef struct {
+    int64_t bin_us[3];
+} freq_dist_sample_t;
+
+static freq_dist_sample_t freq_samples[5];
+static size_t freq_sample_pos;
+static size_t freq_sample_count;
+static int64_t prev_pm_time_us[3];
+static bool prev_pm_time_valid;
+
+static size_t cpu_freq_bin(uint32_t freq_mhz)
+{
+    if (freq_mhz <= 100) {
+        return 0;
+    }
+    if (freq_mhz <= 200) {
+        return 1;
+    }
+    return 2;
+}
+
+static bool read_pm_freq_times(int64_t out_us[3])
+{
+    char *stats_buf = NULL;
+    size_t stats_len = 0;
+    FILE *stream = open_memstream(&stats_buf, &stats_len);
+    if (!stream) {
+        return false;
+    }
+
+    esp_pm_impl_dump_stats(stream);
+    fclose(stream);
+
+    if (!stats_buf) {
+        return false;
+    }
+
+    memset(out_us, 0, sizeof(int64_t) * 3);
+
+    char *saveptr = NULL;
+    char *line = strtok_r(stats_buf, "\n", &saveptr);
+    while (line) {
+        char mode[16];
+        unsigned freq_mhz = 0;
+        long long time_us = 0;
+
+        if (sscanf(line, "%15s %u M %lld", mode, &freq_mhz, &time_us) == 3) {
+            if (strcmp(mode, "APB_MIN") == 0 ||
+                strcmp(mode, "APB_MAX") == 0 ||
+                strcmp(mode, "CPU_MAX") == 0 ||
+                strcmp(mode, "SLEEP") == 0) {
+                out_us[cpu_freq_bin(freq_mhz)] += time_us;
+            }
+        }
+
+        line = strtok_r(NULL, "\n", &saveptr);
+    }
+
+    free(stats_buf);
+    return true;
+}
+
+static void record_cpu_freq_distribution(void)
+{
+    int64_t current_us[3] = {0};
+    if (!read_pm_freq_times(current_us)) {
+        return;
+    }
+
+    if (prev_pm_time_valid) {
+        freq_dist_sample_t sample = {0};
+        for (size_t i = 0; i < 3; i++) {
+            sample.bin_us[i] = current_us[i] >= prev_pm_time_us[i] ? current_us[i] - prev_pm_time_us[i] : 0;
+        }
+
+        freq_samples[freq_sample_pos] = sample;
+        freq_sample_pos = (freq_sample_pos + 1) % (sizeof(freq_samples) / sizeof(freq_samples[0]));
+        if (freq_sample_count < sizeof(freq_samples) / sizeof(freq_samples[0])) {
+            freq_sample_count++;
+        }
+    }
+
+    memcpy(prev_pm_time_us, current_us, sizeof(prev_pm_time_us));
+    prev_pm_time_valid = true;
+}
+
+static void format_freq_distribution(void)
+{
+    int64_t sum_us[3] = {0};
+    int64_t total_us = 0;
+
+    for (size_t i = 0; i < freq_sample_count; i++) {
+        for (size_t j = 0; j < 3; j++) {
+            sum_us[j] += freq_samples[i].bin_us[j];
+            total_us += freq_samples[i].bin_us[j];
+        }
+    }
+
+    if (total_us <= 0) {
+        lv_label_set_text(lbl_freq_dist, "5S DIST: --");
+        return;
+    }
+
+    lv_label_set_text_fmt(lbl_freq_dist,
+                          "5S DIST: 80:%u%% 160:%u%% 240:%u%%",
+                          (unsigned)(sum_us[0] * 100 / total_us),
+                          (unsigned)(sum_us[1] * 100 / total_us),
+                          (unsigned)(sum_us[2] * 100 / total_us));
+}
+
+static void reset_cpu_freq_distribution(void)
+{
+    memset(freq_samples, 0, sizeof(freq_samples));
+    memset(prev_pm_time_us, 0, sizeof(prev_pm_time_us));
+    freq_sample_pos = 0;
+    freq_sample_count = 0;
+    prev_pm_time_valid = false;
+}
+
+static void update_cpu_freq_distribution(void)
+{
+    record_cpu_freq_distribution();
+    format_freq_distribution();
+}
+
+static void update_cpu_freq_labels(void)
+{
+    uint32_t freq_hz = 0;
+    esp_clk_tree_src_get_freq_hz(SOC_MOD_CLK_CPU, ESP_CLK_TREE_SRC_FREQ_PRECISION_CACHED, &freq_hz);
+    uint32_t freq_mhz = freq_hz / 1000000;
+
+    lv_label_set_text_fmt(lbl_cpu_freq, "CPU FREQ: %lu MHz", (unsigned long)freq_mhz);
+    update_cpu_freq_distribution();
+}
 
 static void update_stats(lv_timer_t * t) {
     // Memory and Uptime
@@ -74,6 +213,7 @@ static void update_stats(lv_timer_t * t) {
         lv_label_set_text(lbl_psram, "PSRAM: Not Available");
     }
     lv_label_set_text_fmt(lbl_uptime, "UPTIME: %02d:%02d:%02d", (int)(uptime_s/3600), (int)(uptime_s%3600/60), (int)(uptime_s%60));
+    update_cpu_freq_labels();
 }
 
 void ui_sys_stats_init(lv_obj_t *tile) {
@@ -86,7 +226,7 @@ void ui_sys_stats_init(lv_obj_t *tile) {
     lv_obj_align(cont, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_gap(cont, 8, 0);
+    lv_obj_set_style_pad_gap(cont, 5, 0);
     lv_obj_clear_flag(cont, LV_OBJ_FLAG_SCROLLABLE);
 
     // Title
@@ -94,14 +234,14 @@ void ui_sys_stats_init(lv_obj_t *tile) {
     lv_label_set_text(title, "SYSTEM MONITOR");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0x3498DB), 0);
-    lv_obj_set_style_margin_bottom(title, 10, 0);
+    lv_obj_set_style_margin_bottom(title, 5, 0);
 
     // Spinner for load visualization
     spinner = lv_spinner_create(cont);
-    lv_obj_set_size(spinner, 40, 40);
+    lv_obj_set_size(spinner, 30, 30);
     lv_obj_set_style_arc_width(spinner, 5, LV_PART_MAIN);
     lv_obj_set_style_arc_width(spinner, 5, LV_PART_INDICATOR);
-    lv_obj_set_style_margin_bottom(spinner, 10, 0);
+    lv_obj_set_style_margin_bottom(spinner, 5, 0);
 
     // Static info
     uint32_t flash_size; esp_flash_get_size(NULL, &flash_size);
@@ -119,6 +259,14 @@ void ui_sys_stats_init(lv_obj_t *tile) {
     lbl_cpu_core1 = lv_label_create(cont);
     lv_obj_set_style_text_font(lbl_cpu_core1, &lv_font_montserrat_18, 0);
     lv_obj_set_style_text_color(lbl_cpu_core1, lv_color_hex(0x9B59B6), 0);
+
+    lbl_cpu_freq = lv_label_create(cont);
+    lv_obj_set_style_text_font(lbl_cpu_freq, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(lbl_cpu_freq, lv_color_hex(0xE67E22), 0);
+
+    lbl_freq_dist = lv_label_create(cont);
+    lv_obj_set_style_text_font(lbl_freq_dist, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(lbl_freq_dist, lv_color_hex(0x95A5A6), 0);
 
     lbl_heap = lv_label_create(cont);
     lv_obj_set_style_text_font(lbl_heap, &lv_font_montserrat_18, 0);
@@ -140,6 +288,7 @@ void ui_sys_stats_set_active(bool active) {
     if (active) {
         lv_timer_resume(update_timer);
         lv_obj_remove_flag(spinner, LV_OBJ_FLAG_HIDDEN);
+        reset_cpu_freq_distribution();
         update_stats(update_timer);
     } else {
         lv_timer_pause(update_timer);
