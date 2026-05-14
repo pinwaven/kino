@@ -19,6 +19,15 @@ static lv_obj_t *psys_label;
 
 static int rotate_idx = 0;
 
+static int battery_percent_from_mv(int vbatt_mv) {
+    const int empty_mv = 6400;
+    const int full_mv = 8650;
+
+    if (vbatt_mv <= empty_mv) return 0;
+    if (vbatt_mv >= full_mv) return 100;
+    return (vbatt_mv - empty_mv) * 100 / (full_mv - empty_mv);
+}
+
 static void psys_sw_event_cb(lv_event_t * e) {
     lv_obj_t * sw = lv_event_get_target(e);
     if (lv_obj_has_state(sw, LV_STATE_CHECKED)) {
@@ -70,7 +79,8 @@ static void update_timer_cb(lv_timer_t *timer) {
             lv_obj_set_style_text_color(status_text, lv_color_hex(0x2ECC71), 0); // 绿色
         }
     } else {
-        lv_label_set_text_fmt(main_val_label, "%.2fV", state.bms.vbatt_mv / 1000.0f);
+        int batt_percent = battery_percent_from_mv(state.bms.vbatt_mv);
+        lv_label_set_text_fmt(main_val_label, "%.2fV %d%%", state.bms.vbatt_mv / 1000.0f, batt_percent);
         lv_label_set_text(main_unit_label, "BATTERY VOLTAGE");
         lv_obj_add_flag(charge_icon, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(pd_badge, LV_OBJ_FLAG_HIDDEN);
@@ -111,8 +121,9 @@ static void update_timer_cb(lv_timer_t *timer) {
             break;
         case 3:
             if (state.bms.ac_ok) {
+                int batt_percent = battery_percent_from_mv(state.bms.vbatt_mv);
                 lv_label_set_text(rotate_label, "BATTERY");
-                lv_label_set_text_fmt(rotate_value, "%.2f V", state.bms.vbatt_mv / 1000.0f);
+                lv_label_set_text_fmt(rotate_value, "%.2f V  %d%%", state.bms.vbatt_mv / 1000.0f, batt_percent);
             } else {
                 lv_label_set_text(rotate_label, "INPUT VIN");
                 lv_label_set_text(rotate_value, "0.00 V");

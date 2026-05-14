@@ -6,6 +6,7 @@
 #include "esp_timer.h"
 #include "esp_clk_tree.h"
 #include "esp_private/pm_impl.h"
+#include "driver/temperature_sensor.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdio.h>
@@ -20,8 +21,11 @@ static lv_obj_t *lbl_cpu_core0;
 static lv_obj_t *lbl_cpu_core1;
 static lv_obj_t *lbl_cpu_freq;
 static lv_obj_t *lbl_freq_dist;
+static lv_obj_t *lbl_temp;
 static lv_obj_t *spinner; 
 static lv_timer_t *update_timer;
+static temperature_sensor_handle_t temp_sensor;
+static bool temp_sensor_init_attempted;
 
 static uint32_t prev_idle_ticks[2] = {0, 0};
 static uint32_t prev_total_ticks = 0;
@@ -160,6 +164,47 @@ static void update_cpu_freq_labels(void)
     update_cpu_freq_distribution();
 }
 
+static esp_err_t ensure_temp_sensor(void)
+{
+    if (temp_sensor) {
+        return ESP_OK;
+    }
+
+    if (temp_sensor_init_attempted) {
+        return ESP_FAIL;
+    }
+    temp_sensor_init_attempted = true;
+
+    temperature_sensor_config_t temp_config = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+    esp_err_t err = temperature_sensor_install(&temp_config, &temp_sensor);
+    if (err != ESP_OK) {
+        temp_sensor = NULL;
+        return err;
+    }
+
+    err = temperature_sensor_enable(temp_sensor);
+    if (err != ESP_OK) {
+        temperature_sensor_uninstall(temp_sensor);
+        temp_sensor = NULL;
+    }
+    return err;
+}
+
+static void update_temperature_label(void)
+{
+    float temp_c = 0.0f;
+    esp_err_t err = ensure_temp_sensor();
+    if (err == ESP_OK) {
+        err = temperature_sensor_get_celsius(temp_sensor, &temp_c);
+    }
+
+    if (err == ESP_OK) {
+        lv_label_set_text_fmt(lbl_temp, "TEMP: %.1f C", temp_c);
+    } else {
+        lv_label_set_text(lbl_temp, "TEMP: --");
+    }
+}
+
 static void update_stats(lv_timer_t * t) {
     // Memory and Uptime
     size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -214,6 +259,7 @@ static void update_stats(lv_timer_t * t) {
     }
     lv_label_set_text_fmt(lbl_uptime, "UPTIME: %02d:%02d:%02d", (int)(uptime_s/3600), (int)(uptime_s%3600/60), (int)(uptime_s%60));
     update_cpu_freq_labels();
+    update_temperature_label();
 }
 
 void ui_sys_stats_init(lv_obj_t *tile) {
@@ -267,6 +313,10 @@ void ui_sys_stats_init(lv_obj_t *tile) {
     lbl_freq_dist = lv_label_create(cont);
     lv_obj_set_style_text_font(lbl_freq_dist, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(lbl_freq_dist, lv_color_hex(0x95A5A6), 0);
+
+    lbl_temp = lv_label_create(cont);
+    lv_obj_set_style_text_font(lbl_temp, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(lbl_temp, lv_color_hex(0x1ABC9C), 0);
 
     lbl_heap = lv_label_create(cont);
     lv_obj_set_style_text_font(lbl_heap, &lv_font_montserrat_18, 0);
