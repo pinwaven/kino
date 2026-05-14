@@ -23,18 +23,22 @@ static bool page_active = false;
 
 /* ---- prov start/stop tasks (must not block LVGL task) ------------------- */
 
+static bool s_task_pending = false;
+
 static void prov_start_task(void *arg)
 {
     esp_err_t err = wifi_prov_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "prov start failed: %s", esp_err_to_name(err));
     }
+    s_task_pending = false;
     vTaskDelete(NULL);
 }
 
 static void prov_stop_task(void *arg)
 {
     wifi_prov_stop();
+    s_task_pending = false;
     vTaskDelete(NULL);
 }
 
@@ -105,12 +109,19 @@ void ui_wifi_prov_set_active(bool active)
         last_state = (wifi_prov_state_t)(WIFI_PROV_STATE_IDLE - 1); /* force redraw */
         lv_timer_resume(update_timer);
         lv_timer_ready(update_timer);
-        xTaskCreate(prov_start_task, "prov_start", 4096, NULL, 5, NULL);
+        if (!s_task_pending) {
+            s_task_pending = true;
+            xTaskCreate(prov_start_task, "prov_start", 3072, NULL, 5, NULL);
+        }
     } else {
         lv_timer_pause(update_timer);
-        xTaskCreate(prov_stop_task, "prov_stop", 4096, NULL, 5, NULL);
+        if (!s_task_pending) {
+            s_task_pending = true;
+            xTaskCreate(prov_stop_task, "prov_stop", 2048, NULL, 5, NULL);
+        }
     }
 }
+
 
 void ui_wifi_prov_init(lv_obj_t *tile)
 {

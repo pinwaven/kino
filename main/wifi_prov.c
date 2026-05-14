@@ -325,12 +325,16 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 
 /* ---- public API --------------------------------------------------------- */
 
+static bool s_starting = false;
+static bool s_stopping = false;
+
 esp_err_t wifi_prov_start(void)
 {
-    if (s_state != WIFI_PROV_STATE_IDLE) {
-        ESP_LOGW(TAG, "already running (state=%d)", s_state);
+    if (s_state != WIFI_PROV_STATE_IDLE || s_starting) {
+        ESP_LOGW(TAG, "already running or starting (state=%d)", s_state);
         return ESP_OK;
     }
+    s_starting = true;
 
     /* One-time global initialisation */
     if (!s_global_inited) {
@@ -338,6 +342,7 @@ esp_err_t wifi_prov_start(void)
         esp_err_t r = esp_event_loop_create_default();
         if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) {
             ESP_LOGE(TAG, "event loop create: %s", esp_err_to_name(r));
+            s_starting = false;
             return r;
         }
         s_global_inited = true;
@@ -347,13 +352,27 @@ esp_err_t wifi_prov_start(void)
     if (!s_ap_netif)  s_ap_netif  = esp_netif_create_default_wifi_ap();
     if (!s_sta_netif) s_sta_netif = esp_netif_create_default_wifi_sta();
 
-    /* Init / re-init WiFi driver */
+    /* Init / re-init WiFi driver with leaner config to save internal RAM */
+    ESP_LOGI(TAG, "heap before wifi init: internal=%u dma=%u", 
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
+
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    init_cfg.static_rx_buf_num = 4;     /* default 10 */
+    init_cfg.dynamic_rx_buf_num = 8;    /* default 32 */
+    init_cfg.dynamic_tx_buf_num = 8;    /* default 32 */
+    init_cfg.cache_tx_buf_num = 0;      /* save more memory */
+    
     esp_err_t ret = esp_wifi_init(&init_cfg);
     if (ret != ESP_OK && ret != ESP_ERR_WIFI_INIT_STATE) {
         ESP_LOGE(TAG, "wifi init: %s", esp_err_to_name(ret));
+        s_starting = false;
         return ret;
     }
+
+    ESP_LOGI(TAG, "heap after wifi init: internal=%u dma=%u", 
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
 
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
     esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
@@ -374,6 +393,7 @@ esp_err_t wifi_prov_start(void)
     ret = esp_wifi_start();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "wifi start: %s", esp_err_to_name(ret));
+        s_starting = false;
         return ret;
     }
     s_wifi_started = true;
@@ -381,25 +401,28 @@ esp_err_t wifi_prov_start(void)
     /* DNS semaphore */
     if (!s_dns_done_sem) s_dns_done_sem = xSemaphoreCreateBinary();
 
-    /* Start DNS captive portal */
+    /* Start DNS captive portal (reduce stack if possible, 4096 is safe but generous) */
     s_dns_running = true;
-    xTaskCreate(dns_task, "wifi_prov_dns", 4096, NULL, 5, &s_dns_task_handle);
+    xTaskCreate(dns_task, "wifi_prov_dns", 3072, NULL, 5, &s_dns_task_handle);
 
     /* Start HTTP server */
     ret = start_httpd();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "httpd start: %s", esp_err_to_name(ret));
+        s_starting = false;
         return ret;
     }
 
     s_state = WIFI_PROV_STATE_AP_ACTIVE;
+    s_starting = false;
     ESP_LOGI(TAG, "AP ready: SSID=%s  IP=%s", WIFI_PROV_AP_SSID, WIFI_PROV_AP_IP);
     return ESP_OK;
 }
 
 esp_err_t wifi_prov_stop(void)
 {
-    if (s_state == WIFI_PROV_STATE_IDLE) return ESP_OK;
+    if (s_state == WIFI_PROV_STATE_IDLE || s_stopping) return ESP_OK;
+    s_stopping = true;
 
     s_state = WIFI_PROV_STATE_IDLE;
     memset(s_target_ssid, 0, sizeof(s_target_ssid));
@@ -414,7 +437,7 @@ esp_err_t wifi_prov_stop(void)
     /* Stop DNS task */
     s_dns_running = false;
     if (s_dns_task_handle && s_dns_done_sem) {
-        xSemaphoreTake(s_dns_done_sem, pdMS_TO_TICKS(2000));
+        xSemaphoreTake(s_dns_done_sem, pdMS_TO_TICKS(1000));
         s_dns_task_handle = NULL;
     }
 
@@ -430,9 +453,11 @@ esp_err_t wifi_prov_stop(void)
         s_wifi_started = false;
     }
 
+    s_stopping = false;
     ESP_LOGI(TAG, "stopped");
     return ESP_OK;
 }
+
 
 void wifi_prov_get_status(wifi_prov_status_t *out)
 {
