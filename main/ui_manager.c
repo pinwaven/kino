@@ -8,6 +8,7 @@ static lv_obj_t *t2;
 static lv_obj_t *t3;
 static lv_obj_t *t4;
 static lv_obj_t *t5;
+static lv_obj_t *t6;
 static lv_obj_t *overlay;
 
 static const char *TAG = "UI_MANAGER";
@@ -72,6 +73,7 @@ static void update_active_page(lv_obj_t *active_tile) {
     ui_nfc_set_active(active_tile == t2);
     ui_sys_stats_set_active(active_tile == t4);
     ui_ble_set_active(active_tile == t5);
+    ui_wifi_prov_set_active(active_tile == t6);
 }
 
 static void tileview_event_cb(lv_event_t * e) {
@@ -108,6 +110,10 @@ void ui_init(void) {
     // 第五页：蓝牙控制页 (4,0)
     t5 = lv_tileview_add_tile(tv, 4, 0, LV_DIR_HOR);
     ui_ble_init(t5);
+
+    // 第六页：WiFi 配网页 (5,0)
+    t6 = lv_tileview_add_tile(tv, 5, 0, LV_DIR_HOR);
+    ui_wifi_prov_init(t6);
 
     lv_obj_add_event_cb(tv, tileview_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
