@@ -10,6 +10,7 @@
 
 #define CMD_POLL            0x01
 #define CMD_HI              0x02
+#define CMD_GPIO_READ       0x06
 #define CMD_I2C_WRITE       0x0A
 #define CMD_I2C_READ        0x0B
 #define CMD_GPIO_WRITE      0x07
@@ -46,6 +47,8 @@ esp_err_t stm32_interface_init(void);
 void stm32_get_current_state(stm32_state_t *out_state);
 esp_err_t stm32_update_bmsinfo(void);
 esp_err_t stm32_update_motor_poll(void);
+esp_err_t stm32_read_card_detect(bool *inserted, int *adc1_value, int *cd_value);
+esp_err_t stm32_read_nfc_uuid(char *uuid, uint16_t uuid_len);
 esp_err_t stm32_cmd_send_action(uint8_t cmd, const uint8_t *data, uint16_t len);
 esp_err_t stm32_cmd_send_action_drain(uint8_t cmd, const uint8_t *data, uint16_t len, uint32_t drain_ms);
 esp_err_t stm32_cmd_request(uint8_t cmd, const uint8_t *data, uint16_t len, char *resp, uint16_t resp_len);

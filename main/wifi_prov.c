@@ -4,9 +4,11 @@
 #include "esp_netif.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "esp_heap_caps.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include <string.h>
@@ -19,6 +21,8 @@
 static volatile wifi_prov_state_t s_state = WIFI_PROV_STATE_IDLE;
 static char s_target_ssid[33] = {0};
 static char s_got_ip[16] = {0};
+static char s_pending_ssid[33] = {0};
+static char s_pending_pass[65] = {0};
 
 static httpd_handle_t s_httpd = NULL;
 static TaskHandle_t   s_dns_task_handle = NULL;
@@ -29,6 +33,11 @@ static esp_netif_t *s_ap_netif  = NULL;
 static esp_netif_t *s_sta_netif = NULL;
 static bool s_global_inited = false;
 static bool s_wifi_started  = false;
+static bool s_handlers_registered = false;
+static bool s_portal_running = false;
+static bool s_sta_connected = false;
+
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data);
 
 /* ---- helpers ------------------------------------------------------------ */
 
@@ -63,6 +72,115 @@ static bool form_field(const char *body, const char *key, char *out, size_t out_
     memcpy(tmp, p, raw_len);
     url_decode(out, tmp, out_len);
     return true;
+}
+
+static esp_err_t save_sta_credentials(const char *ssid, const char *pass)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("wifi_sta", NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+
+    err = nvs_set_str(nvs, "ssid", ssid);
+    if (err == ESP_OK) err = nvs_set_str(nvs, "pass", pass ? pass : "");
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "saved WiFi credentials for SSID=%s", ssid);
+    } else {
+        ESP_LOGW(TAG, "save WiFi credentials failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+static bool load_sta_credentials(char *ssid, size_t ssid_len, char *pass, size_t pass_len)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("wifi_sta", NVS_READONLY, &nvs);
+    if (err != ESP_OK) return false;
+
+    size_t len = ssid_len;
+    err = nvs_get_str(nvs, "ssid", ssid, &len);
+    if (err != ESP_OK || ssid[0] == '\0') {
+        nvs_close(nvs);
+        return false;
+    }
+
+    len = pass_len;
+    err = nvs_get_str(nvs, "pass", pass, &len);
+    if (err != ESP_OK) {
+        pass[0] = '\0';
+    }
+    nvs_close(nvs);
+    return true;
+}
+
+static esp_err_t ensure_global_init(void)
+{
+    if (s_global_inited) return ESP_OK;
+
+    esp_err_t r = esp_netif_init();
+    if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "netif init: %s", esp_err_to_name(r));
+        return r;
+    }
+
+    r = esp_event_loop_create_default();
+    if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "event loop create: %s", esp_err_to_name(r));
+        return r;
+    }
+
+    s_global_inited = true;
+    return ESP_OK;
+}
+
+static void ensure_netifs(void)
+{
+    if (!s_ap_netif)  s_ap_netif  = esp_netif_create_default_wifi_ap();
+    if (!s_sta_netif) s_sta_netif = esp_netif_create_default_wifi_sta();
+}
+
+static esp_err_t ensure_wifi_driver(void)
+{
+    if (s_wifi_started) return ESP_OK;
+
+    ESP_LOGI(TAG, "heap before wifi init: internal=%u dma=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
+
+    wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    init_cfg.static_rx_buf_num = 4;
+    init_cfg.dynamic_rx_buf_num = 8;
+    init_cfg.dynamic_tx_buf_num = 8;
+    init_cfg.cache_tx_buf_num = 0;
+
+    esp_err_t ret = esp_wifi_init(&init_cfg);
+    if (ret != ESP_OK && ret != ESP_ERR_WIFI_INIT_STATE) {
+        ESP_LOGE(TAG, "wifi init: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "heap after wifi init: internal=%u dma=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
+
+    ret = esp_wifi_start();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "wifi start: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    s_wifi_started = true;
+    return ESP_OK;
+}
+
+static void register_wifi_handlers(void)
+{
+    if (s_handlers_registered) return;
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
+    s_handlers_registered = true;
 }
 
 /* ---- HTTP handlers ------------------------------------------------------ */
@@ -134,6 +252,8 @@ static esp_err_t handler_connect(httpd_req_t *req)
     }
 
     strncpy(s_target_ssid, ssid, sizeof(s_target_ssid) - 1);
+    strncpy(s_pending_ssid, ssid, sizeof(s_pending_ssid) - 1);
+    strncpy(s_pending_pass, pass, sizeof(s_pending_pass) - 1);
     s_state = WIFI_PROV_STATE_CONNECTING;
 
     /* Respond before connecting so the page loads */
@@ -310,15 +430,23 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *d = data;
         ESP_LOGW(TAG, "STA disconnected, reason=%d", d->reason);
+        s_sta_connected = false;
+        memset(s_got_ip, 0, sizeof(s_got_ip));
         if (s_state == WIFI_PROV_STATE_CONNECTING) {
             s_state = WIFI_PROV_STATE_FAILED;
             /* Revert to AP-only so the HTTP server stays reachable */
-            esp_wifi_set_mode(WIFI_MODE_AP);
+            if (s_portal_running) esp_wifi_set_mode(WIFI_MODE_AP);
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *evt = data;
         snprintf(s_got_ip, sizeof(s_got_ip), IPSTR, IP2STR(&evt->ip_info.ip));
         ESP_LOGI(TAG, "Connected, IP: %s", s_got_ip);
+        s_sta_connected = true;
+        if (s_pending_ssid[0]) {
+            save_sta_credentials(s_pending_ssid, s_pending_pass);
+            memset(s_pending_ssid, 0, sizeof(s_pending_ssid));
+            memset(s_pending_pass, 0, sizeof(s_pending_pass));
+        }
         s_state = WIFI_PROV_STATE_CONNECTED;
     }
 }
@@ -330,52 +458,26 @@ static bool s_stopping = false;
 
 esp_err_t wifi_prov_start(void)
 {
-    if (s_state != WIFI_PROV_STATE_IDLE || s_starting) {
+    if (s_portal_running || s_starting) {
         ESP_LOGW(TAG, "already running or starting (state=%d)", s_state);
         return ESP_OK;
     }
     s_starting = true;
 
-    /* One-time global initialisation */
-    if (!s_global_inited) {
-        esp_netif_init();
-        esp_err_t r = esp_event_loop_create_default();
-        if (r != ESP_OK && r != ESP_ERR_INVALID_STATE) {
-            ESP_LOGE(TAG, "event loop create: %s", esp_err_to_name(r));
-            s_starting = false;
-            return r;
-        }
-        s_global_inited = true;
+    esp_err_t r = ensure_global_init();
+    if (r != ESP_OK) {
+        s_starting = false;
+        return r;
     }
 
-    /* Create netif instances (only once per app run) */
-    if (!s_ap_netif)  s_ap_netif  = esp_netif_create_default_wifi_ap();
-    if (!s_sta_netif) s_sta_netif = esp_netif_create_default_wifi_sta();
+    ensure_netifs();
+    register_wifi_handlers();
 
-    /* Init / re-init WiFi driver with leaner config to save internal RAM */
-    ESP_LOGI(TAG, "heap before wifi init: internal=%u dma=%u", 
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
-
-    wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
-    init_cfg.static_rx_buf_num = 4;     /* default 10 */
-    init_cfg.dynamic_rx_buf_num = 8;    /* default 32 */
-    init_cfg.dynamic_tx_buf_num = 8;    /* default 32 */
-    init_cfg.cache_tx_buf_num = 0;      /* save more memory */
-    
-    esp_err_t ret = esp_wifi_init(&init_cfg);
-    if (ret != ESP_OK && ret != ESP_ERR_WIFI_INIT_STATE) {
-        ESP_LOGE(TAG, "wifi init: %s", esp_err_to_name(ret));
+    esp_err_t ret = ensure_wifi_driver();
+    if (ret != ESP_OK) {
         s_starting = false;
         return ret;
     }
-
-    ESP_LOGI(TAG, "heap after wifi init: internal=%u dma=%u", 
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
-
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
-    esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
 
     wifi_config_t ap_cfg = {
         .ap = {
@@ -388,15 +490,8 @@ esp_err_t wifi_prov_start(void)
         },
     };
 
-    esp_wifi_set_mode(WIFI_MODE_AP);
+    esp_wifi_set_mode(s_sta_connected ? WIFI_MODE_APSTA : WIFI_MODE_AP);
     esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
-    ret = esp_wifi_start();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "wifi start: %s", esp_err_to_name(ret));
-        s_starting = false;
-        return ret;
-    }
-    s_wifi_started = true;
 
     /* DNS semaphore */
     if (!s_dns_done_sem) s_dns_done_sem = xSemaphoreCreateBinary();
@@ -414,6 +509,7 @@ esp_err_t wifi_prov_start(void)
     }
 
     s_state = WIFI_PROV_STATE_AP_ACTIVE;
+    s_portal_running = true;
     s_starting = false;
     ESP_LOGI(TAG, "AP ready: SSID=%s  IP=%s", WIFI_PROV_AP_SSID, WIFI_PROV_AP_IP);
     return ESP_OK;
@@ -421,12 +517,8 @@ esp_err_t wifi_prov_start(void)
 
 esp_err_t wifi_prov_stop(void)
 {
-    if (s_state == WIFI_PROV_STATE_IDLE || s_stopping) return ESP_OK;
+    if ((!s_portal_running && s_state != WIFI_PROV_STATE_FAILED) || s_stopping) return ESP_OK;
     s_stopping = true;
-
-    s_state = WIFI_PROV_STATE_IDLE;
-    memset(s_target_ssid, 0, sizeof(s_target_ssid));
-    memset(s_got_ip, 0, sizeof(s_got_ip));
 
     /* Stop HTTP server */
     if (s_httpd) {
@@ -441,21 +533,78 @@ esp_err_t wifi_prov_stop(void)
         s_dns_task_handle = NULL;
     }
 
-    /* Unregister event handlers */
-    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler);
-    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler);
+    s_portal_running = false;
+    memset(s_target_ssid, 0, sizeof(s_target_ssid));
 
-    /* Stop WiFi driver */
-    if (s_wifi_started) {
+    if (s_sta_connected) {
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        s_state = WIFI_PROV_STATE_CONNECTED;
+    } else if (s_wifi_started) {
         esp_wifi_disconnect();
         esp_wifi_stop();
         esp_wifi_deinit();
         s_wifi_started = false;
+        if (s_handlers_registered) {
+            esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler);
+            esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler);
+            s_handlers_registered = false;
+        }
+        s_state = WIFI_PROV_STATE_IDLE;
+        memset(s_got_ip, 0, sizeof(s_got_ip));
     }
 
     s_stopping = false;
     ESP_LOGI(TAG, "stopped");
     return ESP_OK;
+}
+
+esp_err_t wifi_prov_auto_connect_saved(void)
+{
+    if (s_state != WIFI_PROV_STATE_IDLE || s_starting || s_wifi_started) {
+        return ESP_OK;
+    }
+
+    char ssid[33] = {0};
+    char pass[65] = {0};
+    if (!load_sta_credentials(ssid, sizeof(ssid), pass, sizeof(pass))) {
+        ESP_LOGI(TAG, "no saved WiFi credentials");
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    s_starting = true;
+    esp_err_t ret = ensure_global_init();
+    if (ret != ESP_OK) {
+        s_starting = false;
+        return ret;
+    }
+
+    ensure_netifs();
+    register_wifi_handlers();
+
+    ret = ensure_wifi_driver();
+    if (ret != ESP_OK) {
+        s_starting = false;
+        return ret;
+    }
+
+    wifi_config_t sta_cfg = {0};
+    strncpy((char *)sta_cfg.sta.ssid, ssid, sizeof(sta_cfg.sta.ssid) - 1);
+    strncpy((char *)sta_cfg.sta.password, pass, sizeof(sta_cfg.sta.password) - 1);
+    strncpy(s_target_ssid, ssid, sizeof(s_target_ssid) - 1);
+
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+    ret = esp_wifi_connect();
+    if (ret == ESP_OK) {
+        s_state = WIFI_PROV_STATE_CONNECTING;
+        ESP_LOGI(TAG, "auto connecting to saved SSID=%s", ssid);
+    } else {
+        ESP_LOGW(TAG, "auto connect failed: %s", esp_err_to_name(ret));
+        s_state = WIFI_PROV_STATE_FAILED;
+    }
+
+    s_starting = false;
+    return ret;
 }
 
 

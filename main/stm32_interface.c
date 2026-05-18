@@ -14,6 +14,7 @@
 #define UART_TX_PIN        GPIO_NUM_43
 #define UART_RX_PIN        GPIO_NUM_44
 #define BUF_SIZE           1024
+#define CARD_DETECT_INSERTED_LEVEL 1
 
 static stm32_state_t g_state;
 static SemaphoreHandle_t g_mutex;
@@ -196,6 +197,57 @@ esp_err_t stm32_update_motor_poll(void) {
         parse_motor_poll_response(buf);
     }
     return err;
+}
+
+esp_err_t stm32_read_card_detect(bool *inserted, int *adc1_value, int *cd_value) {
+    char buf[64];
+    int adc1 = -1;
+    int cd = -1;
+    esp_err_t err = request_raw(CMD_GPIO_READ, NULL, 0, buf, sizeof(buf), 150);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    char *adc_pos = strstr(buf, "adc1:");
+    char *cd_pos = strstr(buf, "cd:");
+    if (!cd_pos) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    if (adc_pos) {
+        sscanf(adc_pos, "adc1:%d", &adc1);
+    }
+    if (sscanf(cd_pos, "cd:%d", &cd) != 1) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    if (inserted) *inserted = (cd == CARD_DETECT_INSERTED_LEVEL);
+    if (adc1_value) *adc1_value = adc1;
+    if (cd_value) *cd_value = cd;
+    return ESP_OK;
+}
+
+esp_err_t stm32_read_nfc_uuid(char *uuid, uint16_t uuid_len) {
+    char buf[96];
+    esp_err_t err = request_raw(CMD_NFC_UUID, NULL, 0, buf, sizeof(buf), 1200);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (strncmp(buf, "nfc_uuid:", 9) != 0) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    const char *payload = buf + 9;
+    if (strncmp(payload, "err:", 4) == 0) {
+        return ESP_FAIL;
+    }
+
+    if (uuid && uuid_len > 0) {
+        strncpy(uuid, payload, uuid_len - 1);
+        uuid[uuid_len - 1] = '\0';
+    }
+    return ESP_OK;
 }
 
 esp_err_t stm32_cmd_send_action(uint8_t cmd, const uint8_t *data, uint16_t len) {
