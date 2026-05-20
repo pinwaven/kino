@@ -7,6 +7,9 @@
 
 static lv_obj_t *state_label;
 static lv_obj_t *result_label;
+static lv_obj_t *start_btn_ref;
+static lv_obj_t *stop_btn_ref;
+static lv_obj_t *tile_root;
 static lv_timer_t *ble_timer;
 static bool ble_page_active;
 static bool ble_starting;
@@ -24,9 +27,14 @@ static void update_labels(void) {
     ble_control_state_t state;
     ble_control_get_state(&state);
 
-    const char *status = state.connected ? "已接" :
-                         state.advertising ? "等待" :
-                         state.initialized ? "可用" : "停止";
+    const char *status;
+    if (!ble_control_is_enabled()) {
+        status = "禁用";
+    } else {
+        status = state.connected ? "已接" :
+                 state.advertising ? "等待" :
+                 state.initialized ? "可用" : "停止";
+    }
 
     lv_label_set_text_fmt(state_label, "BT: %s", status);
     lv_label_set_text_fmt(result_label, "命令: %s\n%s\n%s",
@@ -38,6 +46,20 @@ static void update_labels(void) {
 static void ble_timer_cb(lv_timer_t *timer) {
     (void)timer;
     update_labels();
+}
+
+static void set_ble_disabled_ui(bool disabled) {
+    if (tile_root) {
+        lv_obj_set_style_opa(tile_root, disabled ? LV_OPA_60 : LV_OPA_COVER, 0);
+    }
+    if (start_btn_ref) {
+        if (disabled) lv_obj_add_state(start_btn_ref, LV_STATE_DISABLED);
+        else lv_obj_remove_state(start_btn_ref, LV_STATE_DISABLED);
+    }
+    if (stop_btn_ref) {
+        if (disabled) lv_obj_add_state(stop_btn_ref, LV_STATE_DISABLED);
+        else lv_obj_remove_state(stop_btn_ref, LV_STATE_DISABLED);
+    }
 }
 
 static void ble_start_task(void *arg) {
@@ -52,6 +74,13 @@ static void ble_start_task(void *arg) {
 
 static void start_btn_event_cb(lv_event_t *e) {
     (void)e;
+    if (!ble_control_is_enabled()) {
+        if (result_label) {
+            lv_label_set_text(result_label, "命令: --\nBT: 已禁用");
+        }
+        return;
+    }
+
     ble_control_state_t state;
     ble_control_get_state(&state);
 
@@ -78,6 +107,9 @@ static void start_btn_event_cb(lv_event_t *e) {
 
 static void stop_btn_event_cb(lv_event_t *e) {
     (void)e;
+    if (!ble_control_is_enabled()) {
+        return;
+    }
     ble_control_set_active(false);
     set_ble_refresh_mode(false);
     update_labels();
@@ -103,6 +135,7 @@ void ui_ble_set_active(bool active) {
 void ui_ble_init(lv_obj_t *tile) {
     lv_obj_set_style_bg_color(tile, lv_color_hex(0x05070A), 0);
     lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+    tile_root = tile;
 
     lv_obj_t *title = lv_label_create(tile);
     lv_label_set_text(title, "BT控制");
@@ -125,6 +158,7 @@ void ui_ble_init(lv_obj_t *tile) {
     lv_label_set_text(state_label, "BT: 停止");
 
     lv_obj_t *start_btn = lv_button_create(tile);
+    start_btn_ref = start_btn;
     lv_obj_set_size(start_btn, 120, 46);
     lv_obj_align(start_btn, LV_ALIGN_CENTER, -70, 30);
     lv_obj_set_style_bg_color(start_btn, lv_color_hex(0x27AE60), 0);
@@ -137,6 +171,7 @@ void ui_ble_init(lv_obj_t *tile) {
     lv_obj_center(start_label);
 
     lv_obj_t *stop_btn = lv_button_create(tile);
+    stop_btn_ref = stop_btn;
     lv_obj_set_size(stop_btn, 120, 46);
     lv_obj_align(stop_btn, LV_ALIGN_CENTER, 70, 30);
     lv_obj_set_style_bg_color(stop_btn, lv_color_hex(0xC0392B), 0);
@@ -163,7 +198,7 @@ void ui_ble_init(lv_obj_t *tile) {
     lv_obj_set_style_text_color(result_label, lv_color_hex(0xFFFFFF), 0);
     lv_label_set_long_mode(result_label, LV_LABEL_LONG_WRAP);
     lv_obj_align(result_label, LV_ALIGN_BOTTOM_MID, 0, -70);
-    lv_label_set_text(result_label, "命令: --\n點START");
+    lv_label_set_text(result_label, ble_control_is_enabled() ? "命令: --\n點START" : "命令: --\nBT: 已禁用");
 
     lv_obj_t *commands = lv_label_create(tile);
     lv_label_set_text(commands, "指令 open close homing stop nfc status hi");
@@ -176,4 +211,6 @@ void ui_ble_init(lv_obj_t *tile) {
     ble_timer = lv_timer_create(ble_timer_cb, 500, NULL);
     lv_timer_pause(ble_timer);
     ble_page_active = false;
+    set_ble_disabled_ui(!ble_control_is_enabled());
+    update_labels();
 }

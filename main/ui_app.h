@@ -13,6 +13,7 @@ void ui_standby_set_active(bool active);
 void ui_motor_init(lv_obj_t *tile);
 void ui_motor_set_active(bool active);
 void ui_misc_init(lv_obj_t *tile);
+void ui_misc_set_active(bool active);
 void ui_nfc_init(lv_obj_t *tile);
 void ui_nfc_init_compact(lv_obj_t *parent);
 void ui_nfc_set_active(bool active);

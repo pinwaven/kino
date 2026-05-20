@@ -10,6 +10,8 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#if BLE_CONTROL_ENABLED && defined(CONFIG_BT_ENABLED) && CONFIG_BT_ENABLED && defined(CONFIG_BT_NIMBLE_ENABLED) && CONFIG_BT_NIMBLE_ENABLED
+#define BLE_CONTROL_STACK_AVAILABLE 1
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
 #include "host/ble_hs.h"
@@ -18,6 +20,9 @@
 #include "nimble/nimble_port_freertos.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
+#else
+#define BLE_CONTROL_STACK_AVAILABLE 0
+#endif
 #include "stm32_interface.h"
 
 #define BLE_CMD_QUEUE_LEN 4
@@ -26,6 +31,7 @@
 #define BLE_MIN_DMA_HEAP_BEFORE_START 16384
 
 static const char *TAG = "BLE_CONTROL";
+#if BLE_CONTROL_STACK_AVAILABLE
 static const ble_uuid16_t g_service_uuid = BLE_UUID16_INIT(0xFFE0);
 static const ble_uuid16_t g_cmd_uuid = BLE_UUID16_INIT(0xFFE1);
 static const ble_uuid16_t g_status_uuid = BLE_UUID16_INIT(0xFFE2);
@@ -75,6 +81,46 @@ static const struct ble_gatt_svc_def g_gatt_svcs[] = {
     },
     {0}
 };
+#endif
+
+#if !BLE_CONTROL_STACK_AVAILABLE
+
+bool ble_control_is_enabled(void) {
+    return false;
+}
+
+esp_err_t ble_control_set_active(bool active) {
+    (void)active;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+void ble_control_get_state(ble_control_state_t *out_state) {
+    if (!out_state) {
+        return;
+    }
+
+    memset(out_state, 0, sizeof(*out_state));
+    strlcpy(out_state->last_result, "BLE: disabled", sizeof(out_state->last_result));
+    strlcpy(out_state->phy_status, "PHY: off", sizeof(out_state->phy_status));
+}
+
+void ble_control_log_heap(const char *tag) {
+    ESP_LOGI(TAG,
+             "%s heap: dma=%u/%u internal=%u/%u psram=%u/%u",
+             tag ? tag : "BLE",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM));
+}
+
+#else
+
+bool ble_control_is_enabled(void) {
+    return true;
+}
 
 static void set_state_result(const char *cmd, const char *result) {
     if (g_state_mutex && xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -96,18 +142,6 @@ static void set_phy_status(const char *status, bool phy_2m) {
         }
         xSemaphoreGive(g_state_mutex);
     }
-}
-
-void ble_control_log_heap(const char *tag) {
-    ESP_LOGI(TAG,
-             "%s heap: dma=%u/%u internal=%u/%u psram=%u/%u",
-             tag ? tag : "BLE",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
-             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM));
 }
 
 static void set_flag_state(bool active, bool advertising, bool connected, bool notify_enabled) {
@@ -330,8 +364,8 @@ static void cmd_worker_task(void *arg) {
         }
 
         if (strcmp(cmd, "nfc") == 0) {
-            char resp[96];
-            esp_err_t err = stm32_cmd_request_timeout(CMD_NFC_UUID, NULL, 0, resp, sizeof(resp), 1200);
+            char resp[128];
+            esp_err_t err = stm32_read_nfc_first_record(resp, sizeof(resp));
             if (err == ESP_OK) {
                 set_state_result(cmd, resp);
             } else {
@@ -633,6 +667,13 @@ static esp_err_t ble_control_init_once(void) {
 }
 
 esp_err_t ble_control_set_active(bool active) {
+#if !BLE_CONTROL_ENABLED
+    (void)active;
+    set_flag_state(false, false, false, false);
+    set_phy_status("PHY: off", false);
+    set_state_result(NULL, "BLE: disabled");
+    return ESP_ERR_NOT_SUPPORTED;
+#else
     if (!active) {
         ble_control_log_heap("before BLE stop");
         if (!get_initialized()) {
@@ -680,6 +721,7 @@ esp_err_t ble_control_set_active(bool active) {
     }
     ble_control_log_heap("after BLE start");
     return ESP_OK;
+#endif
 }
 
 void ble_control_get_state(ble_control_state_t *out_state) {
@@ -688,10 +730,21 @@ void ble_control_get_state(ble_control_state_t *out_state) {
     }
 
     memset(out_state, 0, sizeof(*out_state));
-    if (g_state_mutex && xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    if (!BLE_CONTROL_ENABLED) {
+        out_state->initialized = false;
+        out_state->active = false;
+        out_state->advertising = false;
+        out_state->connected = false;
+        out_state->notify_enabled = false;
+        out_state->phy_2m = false;
+        strlcpy(out_state->last_result, "BLE: disabled", sizeof(out_state->last_result));
+        strlcpy(out_state->phy_status, "PHY: off", sizeof(out_state->phy_status));
+    } else if (g_state_mutex && xSemaphoreTake(g_state_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
         memcpy(out_state, &g_state, sizeof(*out_state));
         xSemaphoreGive(g_state_mutex);
     } else {
         strlcpy(out_state->last_result, "BLE: unavailable", sizeof(out_state->last_result));
     }
 }
+
+#endif
