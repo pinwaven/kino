@@ -1,7 +1,27 @@
 #include "ui_app.h"
 #include "stm32_interface.h"
+#include "test_flow.h"
 #include "esp_log.h"
 #include <string.h>
+
+static lv_obj_t *mock_sw;
+
+static void sync_motor_mock_switch_from_flash(void)
+{
+    test_flow_reload_settings();
+
+    if (!mock_sw) {
+        return;
+    }
+
+    bool mock = test_flow_is_motor_mock();
+    if (mock) {
+        lv_obj_add_state(mock_sw, LV_STATE_CHECKED);
+    } else {
+        lv_obj_remove_state(mock_sw, LV_STATE_CHECKED);
+    }
+    ESP_LOGI("UI_MISC", "Motor mock loaded: %d", mock);
+}
 
 static void btn_event_cb(lv_event_t * e) {
     uintptr_t type = (uintptr_t)lv_event_get_user_data(e);
@@ -37,12 +57,19 @@ static void btn_event_cb(lv_event_t * e) {
     }
 }
 
+static void mock_sw_event_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    bool mock = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    test_flow_set_motor_mock(mock);
+    ESP_LOGI("UI_MISC", "Motor mock set to %d", mock);
+}
 
 void ui_misc_init(lv_obj_t *tile) {
     lv_obj_set_style_bg_color(tile, lv_color_hex(0x1f0f0f), 0);
     
     lv_obj_t *btn_cont = lv_obj_create(tile);
-    lv_obj_set_size(btn_cont, 300, 260);
+    lv_obj_set_size(btn_cont, 300, 300);
     lv_obj_set_style_bg_opa(btn_cont, 0, 0);
     lv_obj_set_style_border_width(btn_cont, 0, 0);
     lv_obj_align(btn_cont, LV_ALIGN_CENTER, 0, -20);
@@ -56,7 +83,7 @@ void ui_misc_init(lv_obj_t *tile) {
 
     for(int i=0; i<2; i++) {
         lv_obj_t *btn = lv_button_create(btn_cont);
-        lv_obj_set_size(btn, 180, 96);
+        lv_obj_set_size(btn, 180, 72);
         lv_obj_set_style_bg_color(btn, btn_colors[i], 0);
         lv_obj_set_style_radius(btn, 25, 0);
         
@@ -66,5 +93,31 @@ void ui_misc_init(lv_obj_t *tile) {
         lv_obj_center(l);
         
         lv_obj_add_event_cb(btn, btn_event_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)i);
+    }
+
+    lv_obj_t *row = lv_obj_create(btn_cont);
+    lv_obj_set_size(row, 260, 58);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x1F2933), 0);
+    lv_obj_set_style_radius(row, 14, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_hor(row, 14, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *lbl = lv_label_create(row);
+    lv_label_set_text(lbl, "Motor Mock");
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+
+    mock_sw = lv_switch_create(row);
+    lv_obj_add_event_cb(mock_sw, mock_sw_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    sync_motor_mock_switch_from_flash();
+}
+
+void ui_misc_set_active(bool active)
+{
+    if (active) {
+        sync_motor_mock_switch_from_flash();
     }
 }

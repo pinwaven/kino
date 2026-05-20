@@ -9,8 +9,10 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
+#include "dhcpserver/dhcpserver.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
+#include "lwip/inet.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,6 +40,32 @@ static bool s_portal_running = false;
 static bool s_sta_connected = false;
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data);
+
+static void configure_ap_captive_portal_dhcp(void)
+{
+    if (!s_ap_netif) {
+        return;
+    }
+
+    esp_netif_dns_info_t dns = {0};
+    dns.ip.type = ESP_IPADDR_TYPE_V4;
+    dns.ip.u_addr.ip4.addr = ipaddr_addr(WIFI_PROV_AP_IP);
+
+    uint8_t dhcps_offer_dns = OFFER_DNS;
+    static char captiveportal_uri[] = "http://" WIFI_PROV_AP_IP "/";
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcps_stop(s_ap_netif));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET,
+                                                         ESP_NETIF_DOMAIN_NAME_SERVER,
+                                                         &dhcps_offer_dns,
+                                                         sizeof(dhcps_offer_dns)));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_set_dns_info(s_ap_netif, ESP_NETIF_DNS_MAIN, &dns));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcps_option(s_ap_netif, ESP_NETIF_OP_SET,
+                                                         ESP_NETIF_CAPTIVEPORTAL_URI,
+                                                         captiveportal_uri,
+                                                         strlen(captiveportal_uri)));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_dhcps_start(s_ap_netif));
+}
 
 /* ---- helpers ------------------------------------------------------------ */
 
@@ -175,6 +203,14 @@ static esp_err_t ensure_wifi_driver(void)
     return ESP_OK;
 }
 
+static void log_wifi_mode(const char *tag)
+{
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    if (esp_wifi_get_mode(&mode) == ESP_OK) {
+        ESP_LOGI(TAG, "%s wifi mode=%d", tag ? tag : "wifi", (int)mode);
+    }
+}
+
 static void register_wifi_handlers(void)
 {
     if (s_handlers_registered) return;
@@ -287,18 +323,20 @@ static esp_err_t handler_connect(httpd_req_t *req)
 /* Captive portal: redirect everything to the provisioning page */
 static esp_err_t handler_redirect(httpd_req_t *req)
 {
-    httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "http://" WIFI_PROV_AP_IP "/");
-    httpd_resp_send(req, NULL, 0);
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_send(req, "Redirect to captive portal", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
 static esp_err_t handler_404(httpd_req_t *req, httpd_err_code_t err)
 {
     (void)err;
-    httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "http://" WIFI_PROV_AP_IP "/");
-    httpd_resp_send(req, NULL, 0);
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_send(req, "Redirect to captive portal", HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
 }
 
@@ -307,6 +345,7 @@ static esp_err_t start_httpd(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.max_open_sockets = 4;
     cfg.lru_purge_enable = true;
+    cfg.max_uri_handlers = 12;
 
     esp_err_t ret = httpd_start(&s_httpd, &cfg);
     if (ret != ESP_OK) return ret;
@@ -326,6 +365,14 @@ static esp_err_t start_httpd(void)
     /* Windows NCSI */
     static const httpd_uri_t uri_ncsi = {
         .uri = "/ncsi.txt", .method = HTTP_GET, .handler = handler_redirect};
+    static const httpd_uri_t uri_connecttest = {
+        .uri = "/connecttest.txt", .method = HTTP_GET, .handler = handler_redirect};
+    static const httpd_uri_t uri_success = {
+        .uri = "/success.txt", .method = HTTP_GET, .handler = handler_redirect};
+    static const httpd_uri_t uri_canonical = {
+        .uri = "/canonical.html", .method = HTTP_GET, .handler = handler_redirect};
+    static const httpd_uri_t uri_redirect = {
+        .uri = "/redirect", .method = HTTP_GET, .handler = handler_redirect};
 
     httpd_register_uri_handler(s_httpd, &uri_index);
     httpd_register_uri_handler(s_httpd, &uri_post);
@@ -333,6 +380,10 @@ static esp_err_t start_httpd(void)
     httpd_register_uri_handler(s_httpd, &uri_gen204b);
     httpd_register_uri_handler(s_httpd, &uri_hotspot);
     httpd_register_uri_handler(s_httpd, &uri_ncsi);
+    httpd_register_uri_handler(s_httpd, &uri_connecttest);
+    httpd_register_uri_handler(s_httpd, &uri_success);
+    httpd_register_uri_handler(s_httpd, &uri_canonical);
+    httpd_register_uri_handler(s_httpd, &uri_redirect);
     httpd_register_err_handler(s_httpd, HTTPD_404_NOT_FOUND, handler_404);
 
     return ESP_OK;
@@ -490,8 +541,15 @@ esp_err_t wifi_prov_start(void)
         },
     };
 
-    esp_wifi_set_mode(s_sta_connected ? WIFI_MODE_APSTA : WIFI_MODE_AP);
-    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    if (!s_sta_connected) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_disconnect());
+    }
+
+    ESP_LOGI(TAG, "starting provisioning AP: ssid=%s sta_connected=%d", WIFI_PROV_AP_SSID, s_sta_connected);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_mode(s_sta_connected ? WIFI_MODE_APSTA : WIFI_MODE_AP));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
+    log_wifi_mode("after set_mode");
+    configure_ap_captive_portal_dhcp();
 
     /* DNS semaphore */
     if (!s_dns_done_sem) s_dns_done_sem = xSemaphoreCreateBinary();
@@ -511,7 +569,7 @@ esp_err_t wifi_prov_start(void)
     s_state = WIFI_PROV_STATE_AP_ACTIVE;
     s_portal_running = true;
     s_starting = false;
-    ESP_LOGI(TAG, "AP ready: SSID=%s  IP=%s", WIFI_PROV_AP_SSID, WIFI_PROV_AP_IP);
+    ESP_LOGI(TAG, "AP ready: SSID=%s IP=%s", WIFI_PROV_AP_SSID, WIFI_PROV_AP_IP);
     return ESP_OK;
 }
 

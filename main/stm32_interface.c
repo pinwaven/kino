@@ -64,6 +64,37 @@ static esp_err_t read_resp(char *buffer, uint16_t max_len, uint32_t timeout_ms) 
     return ESP_OK;
 }
 
+static esp_err_t read_resp_bytes(uint8_t *buffer, uint16_t max_len, uint16_t *out_len, uint32_t timeout_ms) {
+    uint8_t temp[512];
+    int len = 0;
+    TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(timeout_ms);
+
+    while (len < sizeof(temp)) {
+        TickType_t now = xTaskGetTickCount();
+        if (now >= deadline) break;
+
+        TickType_t wait_ticks = len == 0 ? (deadline - now) : pdMS_TO_TICKS(20);
+        int read_len = uart_read_bytes(UART_PORT_NUM, &temp[len], 1, wait_ticks);
+        if (read_len == 1) {
+            len++;
+            continue;
+        }
+
+        if (len > 0) break;
+    }
+
+    if (len < 3) return ESP_ERR_TIMEOUT;
+    if (temp[0] != STM32_ADDR || temp[1] != STM32_RESP_SEP) return ESP_ERR_INVALID_RESPONSE;
+    if (temp[len - 1] != cal_crc8(temp, len - 1)) return ESP_ERR_INVALID_CRC;
+
+    int payload_len = len - 3;
+    if (payload_len > max_len) return ESP_ERR_NO_MEM;
+
+    memcpy(buffer, &temp[2], payload_len);
+    if (out_len) *out_len = payload_len;
+    return ESP_OK;
+}
+
 static esp_err_t request_raw(uint8_t cmd, const uint8_t *data, uint16_t len, char *resp, uint16_t resp_len, uint32_t timeout_ms) {
     esp_err_t err;
 
@@ -75,6 +106,26 @@ static esp_err_t request_raw(uint8_t cmd, const uint8_t *data, uint16_t len, cha
     err = send_raw(cmd, data, len);
     if (err == ESP_OK && resp && resp_len > 0) {
         err = read_resp(resp, resp_len, timeout_ms);
+    }
+
+    if (g_uart_mutex) {
+        xSemaphoreGive(g_uart_mutex);
+    }
+
+    return err;
+}
+
+static esp_err_t request_raw_bytes(uint8_t cmd, const uint8_t *data, uint16_t len, uint8_t *resp, uint16_t resp_len, uint16_t *out_len, uint32_t timeout_ms) {
+    esp_err_t err;
+
+    if (g_uart_mutex && xSemaphoreTake(g_uart_mutex, pdMS_TO_TICKS(timeout_ms + 200)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    uart_flush_input(UART_PORT_NUM);
+    err = send_raw(cmd, data, len);
+    if (err == ESP_OK && resp && resp_len > 0) {
+        err = read_resp_bytes(resp, resp_len, out_len, timeout_ms);
     }
 
     if (g_uart_mutex) {
@@ -247,6 +298,168 @@ esp_err_t stm32_read_nfc_uuid(char *uuid, uint16_t uuid_len) {
         strncpy(uuid, payload, uuid_len - 1);
         uuid[uuid_len - 1] = '\0';
     }
+    return ESP_OK;
+}
+
+static bool copy_bounded(char *out, uint16_t out_len, const char *prefix, const uint8_t *data, size_t data_len)
+{
+    if (!out || out_len == 0) {
+        return false;
+    }
+
+    size_t prefix_len = prefix ? strlen(prefix) : 0;
+    if (prefix_len >= out_len) {
+        return false;
+    }
+
+    if (prefix_len > 0) {
+        memcpy(out, prefix, prefix_len);
+    }
+
+    size_t copy_len = data_len;
+    if (copy_len >= out_len - prefix_len) {
+        copy_len = out_len - prefix_len - 1;
+    }
+
+    memcpy(out + prefix_len, data, copy_len);
+    out[prefix_len + copy_len] = '\0';
+    return copy_len == data_len;
+}
+
+static bool decode_ndef_record_at(const uint8_t *data, size_t len, char *out, uint16_t out_len)
+{
+    if (!data || len < 3) {
+        return false;
+    }
+
+    uint8_t header = data[0];
+    bool sr = (header & 0x10) != 0;
+    bool il = (header & 0x08) != 0;
+    uint8_t tnf = header & 0x07;
+    size_t pos = 1;
+
+    uint8_t type_len = data[pos++];
+    uint32_t payload_len = 0;
+    if (sr) {
+        if (pos >= len) return false;
+        payload_len = data[pos++];
+    } else {
+        if (pos + 4 > len) return false;
+        payload_len = ((uint32_t)data[pos] << 24) |
+                      ((uint32_t)data[pos + 1] << 16) |
+                      ((uint32_t)data[pos + 2] << 8) |
+                      data[pos + 3];
+        pos += 4;
+    }
+
+    uint8_t id_len = 0;
+    if (il) {
+        if (pos >= len) return false;
+        id_len = data[pos++];
+    }
+
+    if (pos + type_len + id_len + payload_len > len) {
+        return false;
+    }
+
+    const uint8_t *type = data + pos;
+    pos += type_len + id_len;
+    const uint8_t *payload = data + pos;
+
+    if (tnf != 1 || type_len != 1 || payload_len == 0) {
+        return false;
+    }
+
+    if (type[0] == 'T') {
+        uint8_t lang_len = payload[0] & 0x3F;
+        if (1 + lang_len > payload_len) {
+            return false;
+        }
+
+        return copy_bounded(out, out_len, NULL, payload + 1 + lang_len, payload_len - 1 - lang_len);
+    }
+
+    if (type[0] == 'U') {
+        static const char *prefix_map[] = {
+            "",
+            "http://www.",
+            "https://www.",
+            "http://",
+            "https://",
+        };
+        const char *prefix = "";
+        if (payload[0] < (sizeof(prefix_map) / sizeof(prefix_map[0]))) {
+            prefix = prefix_map[payload[0]];
+        }
+
+        return copy_bounded(out, out_len, prefix, payload + 1, payload_len - 1);
+    }
+
+    return false;
+}
+
+static bool decode_ndef_first_record(const uint8_t *data, size_t len, char *out, uint16_t out_len)
+{
+    for (size_t i = 0; i + 2 < len; i++) {
+        if (data[i] != 0x03) {
+            continue;
+        }
+
+        size_t pos = i + 1;
+        size_t msg_len = 0;
+        if (pos >= len) {
+            continue;
+        }
+
+        if (data[pos] == 0xFF) {
+            if (pos + 2 >= len) {
+                continue;
+            }
+            msg_len = ((size_t)data[pos + 1] << 8) | data[pos + 2];
+            pos += 3;
+        } else {
+            msg_len = data[pos++];
+        }
+
+        if (pos + msg_len <= len && decode_ndef_record_at(data + pos, msg_len, out, out_len)) {
+            return true;
+        }
+    }
+
+    for (size_t i = 0; i + 2 < len; i++) {
+        if (decode_ndef_record_at(data + i, len - i, out, out_len)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+esp_err_t stm32_read_nfc_first_record(char *record, uint16_t record_len) {
+    uint8_t buf[512];
+    uint16_t resp_len = 0;
+    const char prefix[] = "nfc_record_read:";
+    const size_t prefix_len = sizeof(prefix) - 1;
+
+    esp_err_t err = request_raw_bytes(CMD_NFC_RECORD_READ, NULL, 0, buf, sizeof(buf), &resp_len, 1200);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (resp_len < prefix_len || memcmp(buf, prefix, prefix_len) != 0) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    const uint8_t *payload = buf + prefix_len;
+    size_t payload_len = resp_len - prefix_len;
+    if (payload_len >= 4 && memcmp(payload, "err:", 4) == 0) {
+        return ESP_FAIL;
+    }
+
+    if (!decode_ndef_first_record(payload, payload_len, record, record_len)) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
     return ESP_OK;
 }
 

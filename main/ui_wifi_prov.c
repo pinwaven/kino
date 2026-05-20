@@ -8,6 +8,8 @@
 
 #define TAG "UI_WIFI_PROV"
 #define QR_SIZE 200
+#define PROV_START_STACK_BYTES 4096
+#define PROV_STOP_STACK_BYTES 6144
 
 /* QR code WiFi URI: phone camera scans this and auto-connects to AP */
 #define QR_DATA "WIFI:T:WPA;S:" WIFI_PROV_AP_SSID ";P:" WIFI_PROV_AP_PASS ";;"
@@ -111,13 +113,24 @@ void ui_wifi_prov_set_active(bool active)
         lv_timer_ready(update_timer);
         if (!s_task_pending) {
             s_task_pending = true;
-            xTaskCreate(prov_start_task, "prov_start", 3072, NULL, 5, NULL);
+            if (xTaskCreate(prov_start_task, "prov_start", PROV_START_STACK_BYTES, NULL, 5, NULL) != pdPASS) {
+                ESP_LOGE(TAG, "failed to create prov_start task");
+                s_task_pending = false;
+            }
         }
     } else {
         lv_timer_pause(update_timer);
+        wifi_prov_status_t st;
+        wifi_prov_get_status(&st);
+        if (st.state == WIFI_PROV_STATE_IDLE) {
+            return;
+        }
         if (!s_task_pending) {
             s_task_pending = true;
-            xTaskCreate(prov_stop_task, "prov_stop", 2048, NULL, 5, NULL);
+            if (xTaskCreate(prov_stop_task, "prov_stop", PROV_STOP_STACK_BYTES, NULL, 5, NULL) != pdPASS) {
+                ESP_LOGE(TAG, "failed to create prov_stop task");
+                s_task_pending = false;
+            }
         }
     }
 }
