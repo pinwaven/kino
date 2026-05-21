@@ -29,6 +29,7 @@ static SemaphoreHandle_t s_lock;
 static TaskHandle_t s_task;
 static bool s_task_started;
 static bool s_motor_mock = true;
+static bool s_wait_card_enabled = true;
 static bool s_motor_action_started;
 static TickType_t s_last_motor_poll_tick;
 
@@ -458,6 +459,16 @@ static void test_flow_step_locked(void)
         return;
     }
 
+    if (!s_wait_card_enabled) {
+        if (s_flow.state != TEST_FLOW_WAIT_CARD) {
+            set_state_locked(TEST_FLOW_WAIT_CARD);
+        }
+        s_flow.card_inserted = false;
+        s_flow.adc1_value = -1;
+        s_flow.cd_value = -1;
+        return;
+    }
+
     bool inserted = false;
     int adc1 = -1;
     int cd = -1;
@@ -521,6 +532,19 @@ void test_flow_start(void)
 void test_flow_update(void)
 {
     /* Legacy entry point kept for compatibility; the flow now runs in its own task. */
+}
+
+void test_flow_set_wait_card_enabled(bool enabled)
+{
+    lock_flow();
+    s_wait_card_enabled = enabled;
+    if (!enabled && s_flow.state == TEST_FLOW_WAIT_CARD) {
+        s_flow.card_inserted = false;
+        s_flow.adc1_value = -1;
+        s_flow.cd_value = -1;
+    }
+    unlock_flow();
+    ESP_LOGI(TAG, "wait-card trigger %s", enabled ? "enabled" : "disabled");
 }
 
 bool test_flow_retry_after_error(void)

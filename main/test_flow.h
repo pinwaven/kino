@@ -46,6 +46,7 @@ void test_flow_set_motor_mock(bool mock);
 void test_flow_init(void);
 void test_flow_start(void);
 void test_flow_update(void);
+void test_flow_set_wait_card_enabled(bool enabled);
 bool test_flow_retry_after_error(void);
 bool test_flow_continue_after_upload_review(void);
 void test_flow_get_snapshot(test_flow_snapshot_t *out);
