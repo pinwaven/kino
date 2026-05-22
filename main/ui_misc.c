@@ -2,9 +2,62 @@
 #include "stm32_interface.h"
 #include "test_flow.h"
 #include "esp_log.h"
+#include "nvs.h"
 #include <string.h>
 
 static lv_obj_t *mock_sw;
+static lv_obj_t *fps_sw;
+static bool fps_show = true;
+
+static void apply_fps_show_setting(void)
+{
+#if LV_USE_PERF_MONITOR
+    if (fps_show) {
+        lv_sysmon_show_performance(NULL);
+    } else {
+        lv_sysmon_hide_performance(NULL);
+    }
+#endif
+}
+
+static void load_fps_show_setting(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open("config", NVS_READONLY, &nvs) == ESP_OK) {
+        uint8_t val = 1;
+        if (nvs_get_u8(nvs, "fps_show", &val) == ESP_OK) {
+            fps_show = (val != 0);
+        }
+        nvs_close(nvs);
+    }
+    apply_fps_show_setting();
+    ESP_LOGI("UI_MISC", "FPS show loaded: %d", fps_show);
+}
+
+static void save_fps_show_setting(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open("config", NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_set_u8(nvs, "fps_show", fps_show ? 1 : 0);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+    ESP_LOGI("UI_MISC", "FPS show saved: %d", fps_show);
+}
+
+static void sync_fps_switch_from_flash(void)
+{
+    load_fps_show_setting();
+    if (!fps_sw) {
+        return;
+    }
+
+    if (fps_show) {
+        lv_obj_add_state(fps_sw, LV_STATE_CHECKED);
+    } else {
+        lv_obj_remove_state(fps_sw, LV_STATE_CHECKED);
+    }
+}
 
 static void sync_motor_mock_switch_from_flash(void)
 {
@@ -65,6 +118,35 @@ static void mock_sw_event_cb(lv_event_t *e)
     ESP_LOGI("UI_MISC", "Motor mock set to %d", mock);
 }
 
+static void fps_sw_event_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    fps_show = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    apply_fps_show_setting();
+    save_fps_show_setting();
+    ESP_LOGI("UI_MISC", "FPS show set to %d", fps_show);
+}
+
+static lv_obj_t *create_switch_row(lv_obj_t *parent, const char *text)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_size(row, 260, 58);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x1F2933), 0);
+    lv_obj_set_style_radius(row, 14, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_hor(row, 14, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *lbl = lv_label_create(row);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+
+    return lv_switch_create(row);
+}
+
 void ui_misc_init(lv_obj_t *tile) {
     lv_obj_set_style_bg_color(tile, lv_color_hex(0x1f0f0f), 0);
     
@@ -95,29 +177,22 @@ void ui_misc_init(lv_obj_t *tile) {
         lv_obj_add_event_cb(btn, btn_event_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)i);
     }
 
-    lv_obj_t *row = lv_obj_create(btn_cont);
-    lv_obj_set_size(row, 260, 58);
-    lv_obj_set_style_bg_color(row, lv_color_hex(0x1F2933), 0);
-    lv_obj_set_style_radius(row, 14, 0);
-    lv_obj_set_style_border_width(row, 0, 0);
-    lv_obj_set_style_pad_hor(row, 14, 0);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *lbl = lv_label_create(row);
-    lv_label_set_text(lbl, "Motor Mock");
-    lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
-
-    mock_sw = lv_switch_create(row);
+    mock_sw = create_switch_row(btn_cont, "Motor Mock");
     lv_obj_add_event_cb(mock_sw, mock_sw_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
     sync_motor_mock_switch_from_flash();
+
+    fps_sw = create_switch_row(btn_cont, "FPS Show");
+    lv_obj_add_event_cb(fps_sw, fps_sw_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    sync_fps_switch_from_flash();
+#if !LV_USE_PERF_MONITOR
+    lv_obj_add_state(fps_sw, LV_STATE_DISABLED);
+#endif
 }
 
 void ui_misc_set_active(bool active)
 {
     if (active) {
         sync_motor_mock_switch_from_flash();
+        sync_fps_switch_from_flash();
     }
 }

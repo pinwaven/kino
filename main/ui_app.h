@@ -24,5 +24,6 @@ void ui_ble_set_active(bool active);
 
 void ui_wifi_prov_init(lv_obj_t *tile);
 void ui_wifi_prov_set_active(bool active);
+void ui_wifi_prov_on_move(void);
 
 #endif // UI_APP_H

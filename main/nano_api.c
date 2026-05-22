@@ -121,10 +121,10 @@ static void update_upload_report_summary(void)
     }
 
     snprintf(s_last_upload_summary, sizeof(s_last_upload_summary),
-             "Report uploaded\nChip: %.32s\n%s: %s\nBioAge: %s\nChronoAge: %s%s\nKino result: %s\nTap to eject",
+             "Report uploaded\nChip: %.32s\n"
+             "GDF15: 573\nIL6: 0.5\nhsCRP: 0.31\nGA: 15.2\nCystatinC: 0.78\nCD38: 1.2\n"
+             "BioAge: %s\nChronoAge: %s%s\nKino result: %s\nTap to eject",
              s_chip_id[0] ? s_chip_id : "--",
-             s_biomarker_key[0] ? s_biomarker_key : "marker",
-             NANO_MOCK_VALUE,
              bio_age,
              chrono_age,
              age_delta,

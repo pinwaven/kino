@@ -10,6 +10,7 @@
 #define QR_SIZE 200
 #define PROV_START_STACK_BYTES 4096
 #define PROV_STOP_STACK_BYTES 6144
+#define WIFI_PROV_PAGE_SETTLE_MS 1000
 
 /* QR code WiFi URI: phone camera scans this and auto-connects to AP */
 #define QR_DATA "WIFI:T:WPA;S:" WIFI_PROV_AP_SSID ";P:" WIFI_PROV_AP_PASS ";;"
@@ -22,6 +23,8 @@ static lv_timer_t *update_timer;
 
 static wifi_prov_state_t last_state = WIFI_PROV_STATE_IDLE - 1; /* force first draw */
 static bool page_active = false;
+static lv_timer_t *delay_timer = NULL;
+static bool delay_target_active = false;
 
 /* ---- prov start/stop tasks (must not block LVGL task) ------------------- */
 
@@ -54,6 +57,41 @@ static void show_qr(bool visible)
     } else {
         lv_obj_add_flag(qr_cont,    LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(ssid_label, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void delay_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    delay_timer = NULL;
+    bool active = delay_target_active;
+
+    if (active) {
+        last_state = (wifi_prov_state_t)(WIFI_PROV_STATE_IDLE - 1); /* force redraw */
+        lv_timer_resume(update_timer);
+        lv_timer_ready(update_timer);
+        if (!s_task_pending) {
+            s_task_pending = true;
+            if (xTaskCreate(prov_start_task, "prov_start", PROV_START_STACK_BYTES, NULL, 5, NULL) != pdPASS) {
+                ESP_LOGE(TAG, "failed to create prov_start task");
+                s_task_pending = false;
+            }
+        }
+    } else {
+        lv_timer_pause(update_timer);
+        show_qr(false);
+        wifi_prov_status_t st;
+        wifi_prov_get_status(&st);
+        if (st.state == WIFI_PROV_STATE_IDLE) {
+            return;
+        }
+        if (!s_task_pending) {
+            s_task_pending = true;
+            if (xTaskCreate(prov_stop_task, "prov_stop", PROV_STOP_STACK_BYTES, NULL, 5, NULL) != pdPASS) {
+                ESP_LOGE(TAG, "failed to create prov_stop task");
+                s_task_pending = false;
+            }
+        }
     }
 }
 
@@ -107,30 +145,26 @@ void ui_wifi_prov_set_active(bool active)
     page_active = active;
     if (!update_timer) return;
 
-    if (active) {
-        last_state = (wifi_prov_state_t)(WIFI_PROV_STATE_IDLE - 1); /* force redraw */
-        lv_timer_resume(update_timer);
-        lv_timer_ready(update_timer);
-        if (!s_task_pending) {
-            s_task_pending = true;
-            if (xTaskCreate(prov_start_task, "prov_start", PROV_START_STACK_BYTES, NULL, 5, NULL) != pdPASS) {
-                ESP_LOGE(TAG, "failed to create prov_start task");
-                s_task_pending = false;
-            }
-        }
-    } else {
-        lv_timer_pause(update_timer);
+    if (delay_timer) {
+        lv_timer_delete(delay_timer);
+        delay_timer = NULL;
+    }
+
+    delay_target_active = active;
+    delay_timer = lv_timer_create(delay_timer_cb, WIFI_PROV_PAGE_SETTLE_MS, NULL);
+    lv_timer_set_repeat_count(delay_timer, 1);
+}
+
+
+void ui_wifi_prov_on_move(void)
+{
+    if (page_active) {
         wifi_prov_status_t st;
         wifi_prov_get_status(&st);
-        if (st.state == WIFI_PROV_STATE_IDLE) {
-            return;
-        }
-        if (!s_task_pending) {
-            s_task_pending = true;
-            if (xTaskCreate(prov_stop_task, "prov_stop", PROV_STOP_STACK_BYTES, NULL, 5, NULL) != pdPASS) {
-                ESP_LOGE(TAG, "failed to create prov_stop task");
-                s_task_pending = false;
-            }
+        if (st.state == WIFI_PROV_STATE_AP_ACTIVE || st.state == WIFI_PROV_STATE_FAILED) {
+            /* Hide the QR while the tile is moving; provisioning keeps running in the background. */
+            show_qr(false);
+            lv_label_set_text(status_label, "Setup paused (moved)");
         }
     }
 }

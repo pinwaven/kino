@@ -7,18 +7,22 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "esp_task_wdt.h"
 #include <string.h>
 #include <stdio.h>
 
 #define MOCK_MOTOR_ACTION_MS 2500
 #define MOCK_ANALYZE_MS 4000
-#define FLOW_TASK_PERIOD_MS 200
+#define FLOW_TASK_PERIOD_MS 100
 #define FLOW_TASK_STACK_BYTES 12288
 #define MOTOR_ACTION_DRAIN_MS 180
 #define MOTOR_POLL_INTERVAL_MS 250
 #define MOTOR_OPEN_TIMEOUT_MS 8000
 #define MOTOR_CLOSE_TIMEOUT_MS 10000
 #define MOTOR_HOMING_TIMEOUT_MS 35000
+#define WAIT_CARD_POLL_SETTLE_MS 500
+#define CARD_DETECT_MAX_FAILS 3
+#define CARD_INSERT_STABLE_POLLS 5
 
 static const char *TAG = "TEST_FLOW";
 
@@ -31,7 +35,11 @@ static bool s_task_started;
 static bool s_motor_mock = true;
 static bool s_wait_card_enabled = true;
 static bool s_motor_action_started;
+static bool s_boot_homing_done;
 static TickType_t s_last_motor_poll_tick;
+static TickType_t s_wait_card_enabled_tick;
+static uint8_t s_card_detect_fail_count;
+static uint8_t s_consecutive_card_count;
 
 typedef enum {
     MOTOR_OP_HOMING,
@@ -40,6 +48,16 @@ typedef enum {
 } motor_op_t;
 
 static void set_last_error_message_locked(const char *message);
+
+bool test_flow_uses_large_error_layout(const char *message)
+{
+    return message &&
+           (strcmp(message, "Chip already used") == 0 ||
+            strcmp(message, "Chip not registered") == 0 ||
+            strcmp(message, "Chip not configured") == 0 ||
+            strcmp(message, "Unknown Nano panel") == 0 ||
+            strcmp(message, "Nano chip has no user_id") == 0);
+}
 
 static void load_settings(void)
 {
@@ -283,6 +301,7 @@ static void reset_for_wait_card_locked(void)
     s_flow.last_error_message[0] = '\0';
     s_flow.upload_summary[0] = '\0';
     s_flow.last_error = ESP_OK;
+    s_card_detect_fail_count = 0;
     set_state_locked(TEST_FLOW_WAIT_CARD);
 }
 
@@ -338,7 +357,10 @@ static bool poll_card_removed_locked(void)
 static void test_flow_step_locked(void)
 {
     if (s_flow.state == TEST_FLOW_PREP_HOMING) {
-        if (run_motor_action_locked(MOTOR_OP_HOMING, MOTOR_HOMING_TIMEOUT_MS)) {
+        motor_op_t prep_op = s_boot_homing_done ? MOTOR_OP_CLOSE : MOTOR_OP_HOMING;
+        uint32_t prep_timeout = s_boot_homing_done ? MOTOR_CLOSE_TIMEOUT_MS : MOTOR_HOMING_TIMEOUT_MS;
+        if (run_motor_action_locked(prep_op, prep_timeout)) {
+            s_boot_homing_done = true;
             set_state_locked(TEST_FLOW_PREP_OPENING);
         }
         return;
@@ -422,13 +444,6 @@ static void test_flow_step_locked(void)
         return;
     }
 
-    if (s_flow.state == TEST_FLOW_DONE) {
-        if (elapsed_ms(1500)) {
-            set_state_locked(TEST_FLOW_SUCCESS_EJECTING);
-        }
-        return;
-    }
-
     if (s_flow.state == TEST_FLOW_SUCCESS_EJECTING) {
         if (run_motor_action_locked(MOTOR_OP_OPEN, MOTOR_OPEN_TIMEOUT_MS)) {
             set_state_locked(TEST_FLOW_WAIT_REMOVE_CARD);
@@ -469,6 +484,15 @@ static void test_flow_step_locked(void)
         return;
     }
 
+    if (s_flow.state == TEST_FLOW_WAIT_CARD &&
+        s_wait_card_enabled_tick != 0 &&
+        (xTaskGetTickCount() - s_wait_card_enabled_tick) < pdMS_TO_TICKS(WAIT_CARD_POLL_SETTLE_MS)) {
+        s_flow.card_inserted = false;
+        s_flow.adc1_value = -1;
+        s_flow.cd_value = -1;
+        return;
+    }
+
     bool inserted = false;
     int adc1 = -1;
     int cd = -1;
@@ -479,17 +503,34 @@ static void test_flow_step_locked(void)
 
     s_flow.last_error = err;
     if (err != ESP_OK) {
-        set_state_locked(TEST_FLOW_CARD_DETECT_ERROR);
+        s_card_detect_fail_count++;
         s_flow.card_inserted = false;
+        s_flow.adc1_value = -1;
+        s_flow.cd_value = -1;
+        ESP_LOGW(TAG, "card detect read failed %u/%u: %s",
+                 (unsigned)s_card_detect_fail_count,
+                 (unsigned)CARD_DETECT_MAX_FAILS,
+                 esp_err_to_name(err));
+        if (s_card_detect_fail_count >= CARD_DETECT_MAX_FAILS) {
+            set_state_locked(TEST_FLOW_CARD_DETECT_ERROR);
+        }
         return;
     }
 
+    s_card_detect_fail_count = 0;
     s_flow.card_inserted = inserted;
     s_flow.adc1_value = adc1;
     s_flow.cd_value = cd;
+
     if (inserted) {
-        set_state_locked(s_flow.state == TEST_FLOW_CARD_DETECTED ? TEST_FLOW_CLOSING : TEST_FLOW_CARD_DETECTED);
+        s_consecutive_card_count++;
+        if (s_consecutive_card_count >= CARD_INSERT_STABLE_POLLS) {
+            set_state_locked(TEST_FLOW_CLOSING);
+        } else {
+            set_state_locked(TEST_FLOW_CARD_DETECTED);
+        }
     } else {
+        s_consecutive_card_count = 0;
         set_state_locked(TEST_FLOW_WAIT_CARD);
     }
 }
@@ -497,7 +538,18 @@ static void test_flow_step_locked(void)
 static void test_flow_task(void *arg)
 {
     (void)arg;
+
+    esp_err_t wdt_err = esp_task_wdt_add(NULL);
+    bool wdt_registered = (wdt_err == ESP_OK);
+    if (!wdt_registered) {
+        ESP_LOGW(TAG, "failed to subscribe test flow task to WDT: %s", esp_err_to_name(wdt_err));
+    }
+
     while (1) {
+        if (wdt_registered) {
+            esp_task_wdt_reset();
+        }
+
         lock_flow();
         test_flow_step_locked();
         unlock_flow();
@@ -514,6 +566,7 @@ void test_flow_init(void)
 
     lock_flow();
     memset(&s_flow, 0, sizeof(s_flow));
+    s_consecutive_card_count = 0;
     s_flow.state = TEST_FLOW_PREP_HOMING;
     s_state_started = xTaskGetTickCount();
     s_flow.adc1_value = -1;
@@ -538,6 +591,8 @@ void test_flow_set_wait_card_enabled(bool enabled)
 {
     lock_flow();
     s_wait_card_enabled = enabled;
+    s_card_detect_fail_count = 0;
+    s_wait_card_enabled_tick = enabled ? xTaskGetTickCount() : 0;
     if (!enabled && s_flow.state == TEST_FLOW_WAIT_CARD) {
         s_flow.card_inserted = false;
         s_flow.adc1_value = -1;
@@ -570,7 +625,7 @@ bool test_flow_continue_after_upload_review(void)
 
     lock_flow();
     if (s_flow.state == TEST_FLOW_UPLOAD_REVIEW) {
-        set_state_locked(TEST_FLOW_DONE);
+        set_state_locked(TEST_FLOW_SUCCESS_EJECTING);
         accepted = true;
     }
     unlock_flow();
@@ -634,7 +689,7 @@ const char *test_flow_status_text(test_flow_state_t state)
         return "Ejecting card";
     case TEST_FLOW_WAIT_CARD:
     default:
-        return "Insert card";
+        return "Insert Card";
     }
 }
 
@@ -737,7 +792,12 @@ const char *test_flow_hint_text(const test_flow_snapshot_t *snapshot)
 
     if (snapshot->state == TEST_FLOW_API_ERROR) {
         if (snapshot->last_error_message[0] != '\0') {
-            snprintf(s_hint, sizeof(s_hint), "%s. Tap to eject", snapshot->last_error_message);
+            const char *msg = snapshot->last_error_message;
+            if (test_flow_uses_large_error_layout(msg)) {
+                snprintf(s_hint, sizeof(s_hint), "%s\nTap to eject", msg);
+            } else {
+                snprintf(s_hint, sizeof(s_hint), "%s. Tap to eject", msg);
+            }
         } else {
             snprintf(s_hint, sizeof(s_hint), "API failed: %s. Tap to eject", esp_err_to_name(snapshot->last_error));
         }

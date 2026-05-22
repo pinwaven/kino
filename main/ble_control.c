@@ -23,12 +23,14 @@
 #else
 #define BLE_CONTROL_STACK_AVAILABLE 0
 #endif
+#include "esp_task_wdt.h"
 #include "stm32_interface.h"
 
 #define BLE_CMD_QUEUE_LEN 4
 #define BLE_CMD_MAX_LEN 31
 #define MOTOR_ACTION_DRAIN_MS 180
 #define BLE_MIN_DMA_HEAP_BEFORE_START 16384
+#define BLE_WDT_TIMEOUT_TICKS pdMS_TO_TICKS(4000)
 
 static const char *TAG = "BLE_CONTROL";
 #if BLE_CONTROL_STACK_AVAILABLE
@@ -321,8 +323,18 @@ static void cmd_worker_task(void *arg) {
     (void)arg;
     ble_cmd_msg_t msg;
 
+    esp_err_t wdt_err = esp_task_wdt_add(NULL);
+    bool wdt_registered = (wdt_err == ESP_OK);
+    if (!wdt_registered) {
+        ESP_LOGW(TAG, "failed to subscribe BLE command worker to WDT: %s", esp_err_to_name(wdt_err));
+    }
+
     while (true) {
-        if (xQueueReceive(g_cmd_queue, &msg, portMAX_DELAY) != pdTRUE) {
+        if (wdt_registered) {
+            esp_task_wdt_reset();
+        }
+
+        if (xQueueReceive(g_cmd_queue, &msg, BLE_WDT_TIMEOUT_TICKS) != pdTRUE) {
             continue;
         }
 

@@ -3,6 +3,7 @@
 #include "bsp/display.h"
 #include "wifi_prov.h"
 #include "test_flow.h"
+#include "stm32_interface.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdio.h>
@@ -38,6 +39,20 @@ static lv_obj_t *diag_loop_fx_bar;
 static lv_point_t diag_touch_start;
 static bool diag_touch_tracking = false;
 
+typedef struct {
+    lv_obj_t *box;
+    lv_obj_t *value;
+    lv_obj_t *name;
+} report_metric_view_t;
+
+enum {
+    REPORT_METRIC_COUNT = 4,
+    REPORT_PAGE_SIZE = REPORT_METRIC_COUNT,
+    REPORT_ITEM_MAX = 12,
+    REPORT_TAP_HITBOX_W = 164,
+    REPORT_TAP_HITBOX_H = 34,
+};
+
 static lv_obj_t *flow_status_label;
 static lv_obj_t *flow_hint_label;
 static lv_obj_t *flow_halo;
@@ -45,7 +60,23 @@ static lv_obj_t *flow_ring_bg;
 static lv_obj_t *flow_ring_main;
 static lv_obj_t *flow_glint_dots[7];
 static lv_obj_t *flow_logo_label;
+static lv_obj_t *flow_logo_sweep_mask;
+static lv_obj_t *flow_logo_sweep_label;
+static lv_color_t flow_logo_last_color;
+static int flow_logo_sweep_phase = -1;
+static int flow_logo_sweep_start_tick;
+static int flow_logo_sweep_wave_phase;
+static bool flow_logo_sweep_running = false;
+static bool flow_logo_recolor_on = false;
 static lv_obj_t *flow_phase_label;
+static lv_obj_t *flow_phase_arrow_label;
+static lv_obj_t *flow_status_arrow_label;
+static lv_obj_t *flow_report_title_label;
+static lv_obj_t *flow_report_chip_label;
+static report_metric_view_t flow_report_metrics[REPORT_METRIC_COUNT];
+static lv_obj_t *flow_report_tap_hitbox;
+static lv_obj_t *flow_report_tap_label;
+static int flow_report_page;
 static lv_timer_t *flow_timer;
 static lv_timer_t *flow_stage_restore_timer;
 static int flow_tick;
@@ -67,6 +98,9 @@ static uint32_t last_dim_restore_ms;
 static const int BRIGHTNESS_NORMAL = 66;
 static const int BRIGHTNESS_DIMMED = 20;
 static const uint32_t INACTIVITY_TIMEOUT_MS = 10000;
+static const uint32_t WAKE_ARM_GUARD_MS = 500;
+static const uint32_t INSERT_CARD_TIMEOUT_MS = 30000;
+static const uint32_t ERROR_INACTIVITY_TIMEOUT_MS = 30000;
 static const uint32_t CARD_AWAKE_HOLD_MS = 60000;
 static const uint32_t REFR_PERIOD_NORMAL = 16;
 static const uint32_t REFR_PERIOD_DIMMED = 200;
@@ -74,8 +108,11 @@ static const uint32_t REFR_PERIOD_AFTER_NETWORK = 80;
 static const uint32_t FLOW_TIMER_PERIOD_MS = 80;
 static const int FLOW_GLINT_DOT_COUNT = 7;
 static const int FLOW_GLINT_RADIUS = 213;
+static const int LOGO_SWEEP_STEPS = 8;
+static const int LOGO_SWEEP_TRAVERSALS = 6;
 static uint32_t network_recover_until_ms;
 static uint32_t keep_awake_until_ms;
+static uint32_t insert_card_wait_until_ms;
 static test_flow_state_t last_flow_state = TEST_FLOW_PREP_HOMING;
 static test_flow_state_t current_flow_state = TEST_FLOW_PREP_HOMING;
 
@@ -87,8 +124,19 @@ static void main_flow_click_cb(lv_event_t *e);
 static void main_tileview_event_cb(lv_event_t *e);
 static void set_pass_swipe_lock(bool locked);
 static void disarm_wait_card_ui(void);
+static bool arm_wait_card_ui(void);
+static bool flow_retryable_error_state(test_flow_state_t state);
+static void set_obj_hidden(lv_obj_t *obj, bool hidden);
 static void build_kino_stage(lv_obj_t *parent);
 static void update_flow_stage_visuals(test_flow_state_t state);
+static void update_flow_logo_effect(test_flow_state_t state);
+static void start_flow_logo_sweep(void);
+static void stop_flow_logo_sweep(void);
+static void build_flow_report(lv_obj_t *parent);
+static void update_flow_report(const test_flow_snapshot_t *flow);
+static void set_flow_report_visible(bool visible);
+static void report_metric_click_cb(lv_event_t *e);
+static void report_eject_click_cb(lv_event_t *e);
 static void set_flow_glint_paused(bool paused);
 static void set_flow_stage_scroll_hidden(bool hidden);
 static void schedule_flow_stage_restore(void);
@@ -146,6 +194,13 @@ static void restore_screen_now(void)
         if (main_tv && lv_tileview_get_tile_active(main_tv) == main_tile) {
             cancel_flow_stage_restore();
             set_flow_stage_scroll_hidden(false);
+            if (current_flow_state == TEST_FLOW_WAIT_CARD) {
+                disarm_wait_card_ui();
+                update_flow_stage_visuals(current_flow_state);
+                update_flow_logo_effect(current_flow_state);
+            } else if (flow_retryable_error_state(current_flow_state)) {
+                set_flow_glint_paused(false);
+            }
         }
         if (flow_timer) {
             lv_timer_set_period(flow_timer, FLOW_TIMER_PERIOD_MS);
@@ -181,7 +236,85 @@ static bool flow_retryable_error_state(test_flow_state_t state)
 
 static bool flow_report_display_state(test_flow_state_t state)
 {
-    return state == TEST_FLOW_UPLOAD_REVIEW || state == TEST_FLOW_DONE;
+    return state == TEST_FLOW_UPLOAD_REVIEW;
+}
+
+static bool flow_large_error_layout(const test_flow_snapshot_t *flow)
+{
+    return flow &&
+           flow->state == TEST_FLOW_API_ERROR &&
+           test_flow_uses_large_error_layout(flow->last_error_message);
+}
+
+static void summary_value_after(const char *summary, const char *prefix, char *out, size_t out_len)
+{
+    if (!out || out_len == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!summary || !prefix) {
+        return;
+    }
+
+    const char *p = strstr(summary, prefix);
+    if (!p) {
+        return;
+    }
+    p += strlen(prefix);
+    const char *end = strchr(p, '\n');
+    size_t len = end ? (size_t)(end - p) : strlen(p);
+    if (len >= out_len) {
+        len = out_len - 1;
+    }
+    memcpy(out, p, len);
+    out[len] = '\0';
+}
+
+typedef struct {
+    char name[24];
+    char value[32];
+} report_item_t;
+
+static bool summary_skip_report_line(const char *line, size_t len)
+{
+    return len == 0 ||
+           strncmp(line, "Report uploaded", len) == 0 ||
+           strncmp(line, "Chip:", 5) == 0 ||
+           strncmp(line, "Kino result:", 12) == 0 ||
+           strncmp(line, "Tap to eject", len) == 0;
+}
+
+static int summary_report_items(const char *summary, report_item_t *items, int max_items)
+{
+    int count = 0;
+    const char *line = summary;
+
+    while (line && *line && count < max_items) {
+        const char *end = strchr(line, '\n');
+        size_t len = end ? (size_t)(end - line) : strlen(line);
+        const char *colon = memchr(line, ':', len);
+
+        if (colon && !summary_skip_report_line(line, len)) {
+            size_t n_len = (size_t)(colon - line);
+            size_t v_len = len - n_len - 1;
+            const char *v = colon + 1;
+            while (v_len > 0 && *v == ' ') {
+                v++;
+                v_len--;
+            }
+            if (n_len >= sizeof(items[count].name)) n_len = sizeof(items[count].name) - 1;
+            if (v_len >= sizeof(items[count].value)) v_len = sizeof(items[count].value) - 1;
+            memcpy(items[count].name, line, n_len);
+            items[count].name[n_len] = '\0';
+            memcpy(items[count].value, v, v_len);
+            items[count].value[v_len] = '\0';
+            count++;
+        }
+
+        line = end ? end + 1 : NULL;
+    }
+
+    return count;
 }
 
 static lv_color_t flow_state_color(test_flow_state_t state)
@@ -213,8 +346,32 @@ static const char *flow_phase_text(test_flow_state_t state)
 {
     if (flow_retryable_error_state(state)) return "ATTENTION";
     if (flow_report_display_state(state)) return "COMPLETE";
-    if (state == TEST_FLOW_WAIT_CARD) return "READY";
+    if (state == TEST_FLOW_WAIT_CARD) return flow_wait_card_armed ? "Insert Card" : "Ready";
     return "PROCESSING";
+}
+
+static uint8_t prompt_pulse_opa(void)
+{
+    int16_t sine = lv_trigo_sin((flow_tick * 24) % 360);
+    if (sine > 0) return 255;
+    return 30;
+}
+
+static void set_prompt_arrow(lv_obj_t *arrow, lv_obj_t *anchor, const char *symbol, bool visible)
+{
+    if (!arrow || !anchor) {
+        return;
+    }
+
+    if (!visible) {
+        set_obj_hidden(arrow, true);
+        return;
+    }
+
+    set_obj_hidden(arrow, false);
+    lv_label_set_text(arrow, symbol);
+    lv_obj_align_to(arrow, anchor, LV_ALIGN_OUT_TOP_MID, 0, 0);
+    lv_obj_set_style_text_opa(arrow, prompt_pulse_opa(), 0);
 }
 
 static void set_auto_dim(bool enabled)
@@ -247,7 +404,7 @@ static void inactivity_timer_cb(lv_timer_t *t)
         return;
     }
 
-    if (current_flow_state != TEST_FLOW_WAIT_CARD) {
+    if (current_flow_state != TEST_FLOW_WAIT_CARD && !flow_retryable_error_state(current_flow_state)) {
         if (is_dimmed) {
             restore_screen_now();
         }
@@ -255,7 +412,7 @@ static void inactivity_timer_cb(lv_timer_t *t)
         return;
     }
 
-    if (keep_awake_active()) {
+    if (keep_awake_active() && !flow_retryable_error_state(current_flow_state)) {
         if (is_dimmed) {
             restore_screen_now();
         }
@@ -263,17 +420,44 @@ static void inactivity_timer_cb(lv_timer_t *t)
         return;
     }
 
-    if (inactive_time >= INACTIVITY_TIMEOUT_MS && !is_dimmed) {
-        if (current_flow_state == TEST_FLOW_WAIT_CARD && flow_wait_card_armed) {
+    if (current_flow_state == TEST_FLOW_WAIT_CARD && flow_wait_card_armed) {
+        if (insert_card_wait_until_ms != 0 &&
+            (int32_t)(insert_card_wait_until_ms - lv_tick_get()) <= 0) {
             disarm_wait_card_ui();
+            lv_display_trigger_activity(NULL);
+            ESP_LOGI(TAG, "Insert-card wait timed out after %ums", (unsigned)INSERT_CARD_TIMEOUT_MS);
+        } else {
+            lv_display_trigger_activity(NULL);
+            return;
         }
+    }
+
+    uint32_t dim_timeout = flow_retryable_error_state(current_flow_state) ?
+                           ERROR_INACTIVITY_TIMEOUT_MS :
+                           INACTIVITY_TIMEOUT_MS;
+
+    if (inactive_time >= dim_timeout && !is_dimmed) {
         cancel_flow_stage_restore();
-        set_flow_stage_scroll_hidden(true);
+        if (flow_retryable_error_state(current_flow_state)) {
+            set_flow_glint_paused(true);
+        } else {
+            set_flow_stage_scroll_hidden(true);
+        }
         bsp_display_brightness_set(BRIGHTNESS_DIMMED);
         if (!flow_render_paused) {
             lv_timer_set_period(lv_display_get_refr_timer(NULL), REFR_PERIOD_DIMMED);
         }
         is_dimmed = true;
+        if (flow_logo_label) {
+            flow_logo_last_color = lv_color_hex(0x7B8794);
+            lv_obj_set_style_text_color(flow_logo_label, flow_logo_last_color, 0);
+        }
+        if (flow_logo_sweep_mask) {
+            stop_flow_logo_sweep();
+        }
+        if (flow_phase_label && current_flow_state == TEST_FLOW_WAIT_CARD) {
+            lv_label_set_text(flow_phase_label, "");
+        }
         if (main_page && lv_obj_has_flag(main_page, LV_OBJ_FLAG_HIDDEN)) {
             lv_obj_remove_flag(overlay, LV_OBJ_FLAG_HIDDEN);
         }
@@ -316,6 +500,10 @@ static void update_test_flow_ui(void)
         disarm_wait_card_ui();
     }
 
+    if (flow_retryable_error_state(flow.state) && !flow_retryable_error_state(last_flow_state)) {
+        keep_awake_until_ms = 0;
+    }
+
     status_text = test_flow_status_text(flow.state);
     hint_text = test_flow_hint_text(&flow);
     hint_color = flow_retryable_error_state(flow.state) ? lv_color_hex(0xFF6B6B) :
@@ -327,7 +515,10 @@ static void update_test_flow_ui(void)
         lv_label_set_text(flow_status_label, status_text);
     }
 
-    bool status_visible = !(flow.state == TEST_FLOW_WAIT_CARD && !flow_wait_card_armed);
+    bool report_visible = flow_report_display_state(flow.state);
+    bool status_visible = !flow_large_error_layout(&flow) && !report_visible;
+    if (flow.state == TEST_FLOW_WAIT_CARD && !flow_wait_card_armed) status_visible = false;
+
     if (status_visible != last_status_visible) {
         if (status_visible) {
             lv_obj_remove_flag(flow_status_label, LV_OBJ_FLAG_HIDDEN);
@@ -341,21 +532,36 @@ static void update_test_flow_ui(void)
         lv_label_set_text(flow_hint_label, hint_text);
     }
 
-    bool hint_visible = flow_retryable_error_state(flow.state) || flow_report_display_state(flow.state);
+    bool hint_visible = flow_retryable_error_state(flow.state) && !report_visible;
     if (hint_visible != last_hint_visible) {
         if (hint_visible) {
             lv_obj_remove_flag(flow_hint_label, LV_OBJ_FLAG_HIDDEN);
             lv_obj_set_width(flow_hint_label, 330);
-            lv_obj_align(flow_hint_label, LV_ALIGN_BOTTOM_MID, 0, -72);
+            if (flow_large_error_layout(&flow)) {
+                lv_obj_align(flow_hint_label, LV_ALIGN_CENTER, 0, 104);
+            } else {
+                lv_obj_align(flow_hint_label, LV_ALIGN_BOTTOM_MID, 0, -72);
+            }
         } else {
             lv_obj_add_flag(flow_hint_label, LV_OBJ_FLAG_HIDDEN);
         }
         last_hint_visible = hint_visible;
+    } else if (hint_visible) {
+        if (flow_large_error_layout(&flow)) {
+            lv_obj_align(flow_hint_label, LV_ALIGN_CENTER, 0, 104);
+        } else {
+            lv_obj_align(flow_hint_label, LV_ALIGN_BOTTOM_MID, 0, -72);
+        }
     }
 
     if (lv_color_to_u32(hint_color) != last_hint_color_full) {
         lv_obj_set_style_text_color(flow_hint_label, hint_color, 0);
         last_hint_color_full = lv_color_to_u32(hint_color);
+    }
+
+    set_flow_report_visible(report_visible);
+    if (report_visible) {
+        update_flow_report(&flow);
     }
 
     if (last_flow_state != TEST_FLOW_CARD_DETECTED && flow.state == TEST_FLOW_CARD_DETECTED) {
@@ -369,6 +575,10 @@ static void update_test_flow_ui(void)
     if (last_flow_state != TEST_FLOW_WAIT_CARD && flow.state == TEST_FLOW_WAIT_CARD && keep_awake_until_ms != 0) {
         keep_awake_until_ms = 0;
         ESP_LOGI(TAG, "Flow returned to wait-card, cleared keep-awake hold");
+    }
+
+    if (last_flow_state != TEST_FLOW_WAIT_CARD && flow.state == TEST_FLOW_WAIT_CARD && !flow_wait_card_armed && !is_dimmed) {
+        start_flow_logo_sweep();
     }
 
     last_flow_state = flow.state;
@@ -388,11 +598,42 @@ static void set_pass_swipe_lock(bool locked)
 static void disarm_wait_card_ui(void)
 {
     flow_wait_card_armed = false;
+    insert_card_wait_until_ms = 0;
     test_flow_set_wait_card_enabled(false);
     if (flow_status_label) {
         lv_obj_add_flag(flow_status_label, LV_OBJ_FLAG_HIDDEN);
     }
     last_status_visible = false;
+    last_visual_state = (test_flow_state_t)-1;
+    if (flow_phase_label && current_flow_state == TEST_FLOW_WAIT_CARD) {
+        lv_label_set_text(flow_phase_label, "");
+    }
+    if (!is_dimmed && current_flow_state == TEST_FLOW_WAIT_CARD) {
+        start_flow_logo_sweep();
+    }
+}
+
+static bool arm_wait_card_ui(void)
+{
+    if (current_flow_state != TEST_FLOW_WAIT_CARD || flow_wait_card_armed) {
+        return false;
+    }
+
+    flow_wait_card_armed = true;
+    stop_flow_logo_sweep();
+    insert_card_wait_until_ms = lv_tick_get() + INSERT_CARD_TIMEOUT_MS;
+    if (flow_status_label) {
+        lv_obj_add_flag(flow_status_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    last_status_visible = false;
+    last_visual_state = (test_flow_state_t)-1;
+    update_test_flow_ui();
+    update_flow_stage_visuals(current_flow_state);
+    stm32_cmd_send_action(CMD_HI, NULL, 0);
+    ESP_LOGI(TAG, "Sent HI after Insert Card prompt");
+    test_flow_set_wait_card_enabled(true);
+    ESP_LOGI(TAG, "Wait-card armed by main flow tap");
+    return true;
 }
 
 static void set_flow_glint_paused(bool paused)
@@ -455,6 +696,12 @@ static void flow_stage_restore_timer_cb(lv_timer_t *timer)
 
     if (main_tv && lv_tileview_get_tile_active(main_tv) == main_tile) {
         set_flow_stage_scroll_hidden(false);
+        if (current_flow_state == TEST_FLOW_WAIT_CARD && !flow_wait_card_armed && !is_dimmed) {
+            if (flow_phase_label) {
+                lv_label_set_text(flow_phase_label, "Ready");
+            }
+            start_flow_logo_sweep();
+        }
     }
 }
 
@@ -479,6 +726,7 @@ static void flow_timer_cb(lv_timer_t *timer)
     flow_tick++;
     update_test_flow_ui();
     update_flow_stage_visuals(current_flow_state);
+    update_flow_logo_effect(current_flow_state);
 
     if (flow_network_busy_state(current_flow_state)) {
         if (!flow_timer_slow) {
@@ -760,6 +1008,168 @@ static lv_obj_t *create_flow_arc(lv_obj_t *parent, int size, int width, lv_color
     return arc;
 }
 
+static void create_report_metric(lv_obj_t *parent, int x, int y, report_metric_view_t *metric)
+{
+    metric->box = lv_obj_create(parent);
+    lv_obj_set_size(metric->box, 94, 56);
+    lv_obj_align(metric->box, LV_ALIGN_CENTER, x, y);
+    lv_obj_set_style_bg_color(metric->box, lv_color_hex(0x101D32), 0);
+    lv_obj_set_style_bg_opa(metric->box, LV_OPA_40, 0);
+    lv_obj_set_style_border_color(metric->box, lv_color_hex(0x38527E), 0);
+    lv_obj_set_style_border_opa(metric->box, LV_OPA_40, 0);
+    lv_obj_set_style_border_width(metric->box, 1, 0);
+    lv_obj_set_style_radius(metric->box, 8, 0);
+    lv_obj_set_style_pad_all(metric->box, 5, 0);
+    lv_obj_clear_flag(metric->box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(metric->box, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_flag(metric->box, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(metric->box, report_metric_click_cb, LV_EVENT_CLICKED, NULL);
+
+    metric->value = lv_label_create(metric->box);
+    lv_obj_set_width(metric->value, 82);
+    lv_obj_set_style_text_align(metric->value, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(metric->value, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(metric->value, lv_color_hex(0xFFFFFF), 0);
+    lv_label_set_long_mode(metric->value, LV_LABEL_LONG_DOT);
+    lv_obj_align(metric->value, LV_ALIGN_TOP_MID, 0, 4);
+
+    metric->name = lv_label_create(metric->box);
+    lv_obj_set_width(metric->name, 82);
+    lv_obj_set_style_text_align(metric->name, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(metric->name, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(metric->name, lv_color_hex(0x9EB4D1), 0);
+    lv_label_set_long_mode(metric->name, LV_LABEL_LONG_DOT);
+    lv_obj_align(metric->name, LV_ALIGN_BOTTOM_MID, 0, -3);
+}
+
+static void build_flow_report(lv_obj_t *parent)
+{
+    flow_report_title_label = lv_label_create(parent);
+    lv_label_set_text(flow_report_title_label, "Uploaded");
+    lv_obj_set_width(flow_report_title_label, 260);
+    lv_obj_set_style_text_align(flow_report_title_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(flow_report_title_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(flow_report_title_label, lv_color_hex(0xF7FBFF), 0);
+    lv_obj_align(flow_report_title_label, LV_ALIGN_CENTER, 0, -105);
+    lv_obj_add_flag(flow_report_title_label, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    flow_report_chip_label = lv_label_create(parent);
+    lv_label_set_text(flow_report_chip_label, "--");
+    lv_obj_set_width(flow_report_chip_label, 270);
+    lv_obj_set_style_text_align(flow_report_chip_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(flow_report_chip_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(flow_report_chip_label, lv_color_hex(0xA6C4E5), 0);
+    lv_label_set_long_mode(flow_report_chip_label, LV_LABEL_LONG_DOT);
+    lv_obj_align(flow_report_chip_label, LV_ALIGN_CENTER, 0, -78);
+    lv_obj_add_flag(flow_report_chip_label, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    create_report_metric(parent, -58, -9, &flow_report_metrics[0]);
+    create_report_metric(parent, 58, -9, &flow_report_metrics[1]);
+    create_report_metric(parent, -58, 55, &flow_report_metrics[2]);
+    create_report_metric(parent, 58, 55, &flow_report_metrics[3]);
+
+    flow_report_tap_hitbox = lv_button_create(parent);
+    lv_obj_set_size(flow_report_tap_hitbox, REPORT_TAP_HITBOX_W, REPORT_TAP_HITBOX_H);
+    lv_obj_align(flow_report_tap_hitbox, LV_ALIGN_CENTER, 0, 118);
+    lv_obj_set_style_bg_opa(flow_report_tap_hitbox, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(flow_report_tap_hitbox, 0, 0);
+    lv_obj_set_style_pad_all(flow_report_tap_hitbox, 0, 0);
+    lv_obj_clear_flag(flow_report_tap_hitbox, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(flow_report_tap_hitbox, report_eject_click_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_move_foreground(flow_report_tap_hitbox);
+
+    flow_report_tap_label = lv_label_create(flow_report_tap_hitbox);
+    lv_label_set_text(flow_report_tap_label, "Tap to eject");
+    lv_obj_set_width(flow_report_tap_label, REPORT_TAP_HITBOX_W);
+    lv_obj_set_style_text_align(flow_report_tap_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(flow_report_tap_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(flow_report_tap_label, lv_color_hex(0xA6C4E5), 0);
+    lv_obj_center(flow_report_tap_label);
+    lv_obj_add_flag(flow_report_tap_label, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    set_flow_report_visible(false);
+}
+
+static void set_flow_report_visible(bool visible)
+{
+    lv_obj_t *items[] = {
+        flow_report_title_label,
+        flow_report_chip_label,
+        flow_report_metrics[0].box,
+        flow_report_metrics[1].box,
+        flow_report_metrics[2].box,
+        flow_report_metrics[3].box,
+        flow_report_tap_hitbox,
+    };
+
+    for (size_t i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
+        if (items[i]) {
+            set_obj_hidden(items[i], !visible);
+        }
+    }
+}
+
+static void update_flow_report(const test_flow_snapshot_t *flow)
+{
+    char chip[48] = "--";
+    report_item_t items[REPORT_ITEM_MAX];
+    int count;
+
+    if (!flow) {
+        return;
+    }
+
+    summary_value_after(flow->upload_summary, "Chip: ", chip, sizeof(chip));
+    count = summary_report_items(flow->upload_summary, items, (int)(sizeof(items) / sizeof(items[0])));
+    if (count <= 0) {
+        count = 1;
+        strncpy(items[0].name, "Report", sizeof(items[0].name) - 1);
+        strncpy(items[0].value, "Done", sizeof(items[0].value) - 1);
+    }
+    if (flow_report_page * REPORT_PAGE_SIZE >= count) {
+        flow_report_page = 0;
+    }
+
+    lv_label_set_text(flow_report_title_label, "Uploaded");
+    lv_label_set_text(flow_report_chip_label, chip[0] ? chip : "--");
+
+    for (int i = 0; i < REPORT_METRIC_COUNT; i++) {
+        int idx = flow_report_page * REPORT_PAGE_SIZE + i;
+        if (idx < count) {
+            lv_label_set_text(flow_report_metrics[i].value, items[idx].value);
+            lv_label_set_text(flow_report_metrics[i].name, items[idx].name);
+            set_obj_hidden(flow_report_metrics[i].box, false);
+        } else {
+            set_obj_hidden(flow_report_metrics[i].box, true);
+        }
+    }
+}
+
+static void report_metric_click_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!flow_report_display_state(current_flow_state)) {
+        return;
+    }
+    flow_report_page++;
+    test_flow_snapshot_t flow;
+    test_flow_get_snapshot(&flow);
+    update_flow_report(&flow);
+    lv_event_stop_bubbling(e);
+}
+
+static void report_eject_click_cb(lv_event_t *e)
+{
+    (void)e;
+    if (current_flow_state == TEST_FLOW_UPLOAD_REVIEW &&
+        test_flow_continue_after_upload_review()) {
+        keep_awake_for(CARD_AWAKE_HOLD_MS);
+        update_test_flow_ui();
+        ESP_LOGI(TAG, "Report eject triggered by tap label");
+    }
+    lv_event_stop_bubbling(e);
+}
+
 static void build_kino_stage(lv_obj_t *parent)
 {
     flow_halo = lv_obj_create(parent);
@@ -797,25 +1207,59 @@ static void build_kino_stage(lv_obj_t *parent)
     flow_logo_label = lv_label_create(parent);
     lv_label_set_text(flow_logo_label, "KINO");
     lv_obj_set_style_text_font(flow_logo_label, &lv_font_montserrat_48, 0);
-    lv_obj_set_style_text_color(flow_logo_label, lv_color_hex(0xEEF2FF), 0);
+    flow_logo_last_color = lv_color_hex(0xEEF2FF);
+    lv_obj_set_style_text_color(flow_logo_label, flow_logo_last_color, 0);
     lv_obj_set_style_text_letter_space(flow_logo_label, 6, 0);
     lv_obj_align(flow_logo_label, LV_ALIGN_CENTER, 3, -18);
     lv_obj_add_flag(flow_logo_label, LV_OBJ_FLAG_EVENT_BUBBLE);
 
+    flow_logo_sweep_mask = lv_obj_create(parent);
+    lv_obj_set_size(flow_logo_sweep_mask, 34, 116);
+    lv_obj_set_style_bg_opa(flow_logo_sweep_mask, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(flow_logo_sweep_mask, 0, 0);
+    lv_obj_set_style_pad_all(flow_logo_sweep_mask, 0, 0);
+    lv_obj_set_style_transform_rotation(flow_logo_sweep_mask, 450, 0);
+    lv_obj_set_style_transform_pivot_x(flow_logo_sweep_mask, 17, 0);
+    lv_obj_set_style_transform_pivot_y(flow_logo_sweep_mask, 58, 0);
+    lv_obj_set_style_transform_width(flow_logo_sweep_mask, 48, 0);
+    lv_obj_set_style_transform_height(flow_logo_sweep_mask, 48, 0);
+    lv_obj_clear_flag(flow_logo_sweep_mask, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(flow_logo_sweep_mask, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(flow_logo_sweep_mask, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    flow_logo_sweep_label = lv_label_create(flow_logo_sweep_mask);
+    lv_label_set_text(flow_logo_sweep_label, "KINO");
+    lv_obj_set_style_text_font(flow_logo_sweep_label, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(flow_logo_sweep_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_letter_space(flow_logo_sweep_label, 6, 0);
+    lv_obj_add_flag(flow_logo_sweep_label, LV_OBJ_FLAG_EVENT_BUBBLE);
+
     flow_phase_label = lv_label_create(parent);
-    lv_label_set_text(flow_phase_label, "READY");
+    lv_label_set_text(flow_phase_label, "Ready");
     lv_obj_set_width(flow_phase_label, 220);
     lv_obj_set_style_text_align(flow_phase_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(flow_phase_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(flow_phase_label, lv_color_hex(0xA6C4E5), 0);
+    lv_label_set_long_mode(flow_phase_label, LV_LABEL_LONG_CLIP);
     lv_obj_set_style_text_letter_space(flow_phase_label, 2, 0);
     lv_obj_align(flow_phase_label, LV_ALIGN_CENTER, 0, 42);
     lv_obj_add_flag(flow_phase_label, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    flow_phase_arrow_label = lv_label_create(parent);
+    lv_label_set_text(flow_phase_arrow_label, LV_SYMBOL_UP);
+    lv_obj_set_style_text_font(flow_phase_arrow_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(flow_phase_arrow_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_opa(flow_phase_arrow_label, LV_OPA_0, 0);
+    lv_obj_align_to(flow_phase_arrow_label, flow_phase_label, LV_ALIGN_OUT_TOP_MID, 0, 0);
+    lv_obj_add_flag(flow_phase_arrow_label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(flow_phase_arrow_label, LV_OBJ_FLAG_EVENT_BUBBLE);
 }
 
 static void update_flow_stage_visuals(test_flow_state_t state)
 {
     lv_color_t color = is_dimmed ? lv_color_hex(0x5E6B78) : flow_state_color(state);
+    lv_opa_t logo_opa = flow_report_display_state(state) ? LV_OPA_20 :
+                         (!is_dimmed && state != TEST_FLOW_WAIT_CARD) ? LV_OPA_50 : LV_OPA_COVER;
     int speed = flow_retryable_error_state(state) ? 13 :
                 flow_report_display_state(state) ? 3 :
                 state == TEST_FLOW_WAIT_CARD ? 2 : 7;
@@ -847,12 +1291,58 @@ static void update_flow_stage_visuals(test_flow_state_t state)
             lv_obj_set_style_bg_opa(flow_glint_dots[i], dot_opa, 0);
         }
 
-        lv_obj_set_style_text_color(flow_logo_label, is_dimmed ? lv_color_hex(0x7B8794) : lv_color_hex(0xEEF2FF), 0);
-        lv_label_set_text(flow_phase_label, flow_phase_text(state));
+        flow_logo_last_color = is_dimmed ? lv_color_hex(0x7B8794) : lv_color_hex(0xEEF2FF);
+        lv_obj_set_style_text_color(flow_logo_label, flow_logo_last_color, 0);
+        lv_obj_set_style_text_opa(flow_logo_label, logo_opa, 0);
+        if ((is_dimmed && state == TEST_FLOW_WAIT_CARD) ||
+            flow_report_display_state(state) ||
+            state == TEST_FLOW_WAIT_REMOVE_CARD ||
+            (state == TEST_FLOW_WAIT_CARD && flow_wait_card_armed)) {
+            lv_label_set_text(flow_phase_label, "");
+        } else {
+            lv_label_set_text(flow_phase_label, flow_phase_text(state));
+        }
         lv_obj_set_style_text_color(flow_phase_label, color, 0);
+        lv_obj_set_style_text_opa(flow_phase_label, LV_OPA_COVER, 0);
+
+        if (flow_report_display_state(state)) {
+            lv_obj_set_style_text_color(flow_report_tap_label, color, 0);
+        }
 
         last_visual_state = state;
         last_visual_dimmed = is_dimmed;
+    }
+
+    if (state == TEST_FLOW_WAIT_CARD && flow_wait_card_armed && !is_dimmed) {
+        set_prompt_arrow(flow_status_arrow_label, flow_status_label, LV_SYMBOL_UP, true);
+        if (flow_phase_arrow_label) {
+            set_obj_hidden(flow_phase_arrow_label, true);
+        }
+        if (flow_status_label && !lv_obj_has_flag(flow_status_label, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_set_style_text_opa(flow_status_label, prompt_pulse_opa(), 0);
+        }
+    } else if (flow_report_display_state(state) && !is_dimmed) {
+        if (flow_report_tap_label) {
+            lv_obj_set_style_text_opa(flow_report_tap_label, prompt_pulse_opa(), 0);
+        }
+    } else if (state == TEST_FLOW_WAIT_REMOVE_CARD && !is_dimmed) {
+        set_prompt_arrow(flow_status_arrow_label, flow_status_label, LV_SYMBOL_DOWN, true);
+        if (flow_phase_arrow_label) {
+            set_obj_hidden(flow_phase_arrow_label, true);
+        }
+        if (flow_status_label && !lv_obj_has_flag(flow_status_label, LV_OBJ_FLAG_HIDDEN)) {
+            lv_obj_set_style_text_opa(flow_status_label, prompt_pulse_opa(), 0);
+        }
+    } else {
+        if (flow_phase_arrow_label) {
+            set_obj_hidden(flow_phase_arrow_label, true);
+        }
+        if (flow_status_arrow_label) {
+            set_obj_hidden(flow_status_arrow_label, true);
+        }
+        if (flow_status_label) {
+            lv_obj_set_style_text_opa(flow_status_label, LV_OPA_COVER, 0);
+        }
     }
 
     int base_angle = (270 + flow_tick * speed * 2) % 360;
@@ -863,6 +1353,102 @@ static void update_flow_stage_visuals(test_flow_state_t state)
         int y = (FLOW_GLINT_RADIUS * lv_trigo_sin(angle)) >> LV_TRIGO_SHIFT;
         lv_obj_align(flow_glint_dots[i], LV_ALIGN_CENTER, x, y);
     }
+}
+
+static void update_flow_logo_effect(test_flow_state_t state)
+{
+    if (!flow_logo_label || !flow_logo_sweep_mask || !flow_logo_sweep_label || flow_stage_scroll_hidden) {
+        return;
+    }
+
+    bool rainbow_ready = state == TEST_FLOW_WAIT_CARD && !flow_wait_card_armed && !is_dimmed;
+
+    if (rainbow_ready && flow_logo_sweep_running) {
+        lv_area_t logo_area;
+        lv_area_t parent_area;
+        int32_t logo_w;
+        int32_t logo_h;
+        int32_t mask_w;
+        int32_t travel;
+        int elapsed = flow_tick - flow_logo_sweep_start_tick;
+        int traversal = elapsed / LOGO_SWEEP_STEPS;
+        int step = elapsed % LOGO_SWEEP_STEPS;
+        int phase;
+        int wave_angle;
+        int32_t wave_amp;
+        int32_t wave_y;
+
+        if (traversal >= LOGO_SWEEP_TRAVERSALS) {
+            stop_flow_logo_sweep();
+            return;
+        }
+
+        phase = (traversal & 1) ? (LOGO_SWEEP_STEPS - step) : step;
+
+        if (flow_logo_recolor_on && phase == flow_logo_sweep_phase) {
+            return;
+        }
+
+        lv_obj_update_layout(flow_logo_label);
+        lv_obj_get_coords(flow_logo_label, &logo_area);
+        lv_obj_get_coords(lv_obj_get_parent(flow_logo_label), &parent_area);
+        logo_w = lv_area_get_width(&logo_area);
+        logo_h = lv_area_get_height(&logo_area);
+        mask_w = lv_obj_get_width(flow_logo_sweep_mask);
+        travel = logo_w + mask_w * 2;
+
+        int32_t mask_x = logo_area.x1 - parent_area.x1 - mask_w + (travel * phase) / LOGO_SWEEP_STEPS;
+        wave_angle = (flow_logo_sweep_wave_phase + elapsed * 22) % 360;
+        wave_amp = logo_h / 5;
+        wave_y = (wave_amp * lv_trigo_sin(wave_angle)) >> LV_TRIGO_SHIFT;
+        int32_t mask_y = logo_area.y1 - parent_area.y1 - 28 + wave_y;
+        lv_obj_set_style_text_color(flow_logo_sweep_label,
+                                    lv_color_hsv_to_rgb((uint16_t)((elapsed * 37) % 360), 92, 100),
+                                    0);
+        lv_obj_set_pos(flow_logo_sweep_mask, mask_x, mask_y);
+        lv_obj_set_pos(flow_logo_sweep_label,
+                       (logo_area.x1 - parent_area.x1) - mask_x,
+                       (logo_area.y1 - parent_area.y1) - mask_y);
+        lv_obj_remove_flag(flow_logo_sweep_mask, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(flow_logo_sweep_mask);
+        flow_logo_sweep_phase = phase;
+        flow_logo_recolor_on = true;
+        return;
+    }
+
+    lv_color_t logo_color = is_dimmed ? lv_color_hex(0x7B8794) : lv_color_hex(0xEEF2FF);
+    if (flow_logo_recolor_on) {
+        stop_flow_logo_sweep();
+    }
+
+    if (lv_color_to_u32(logo_color) != lv_color_to_u32(flow_logo_last_color)) {
+        lv_obj_set_style_text_color(flow_logo_label, logo_color, 0);
+        flow_logo_last_color = logo_color;
+    }
+}
+
+static void start_flow_logo_sweep(void)
+{
+    if (!flow_logo_sweep_mask || !flow_logo_sweep_label || is_dimmed || flow_wait_card_armed) {
+        return;
+    }
+
+    flow_logo_sweep_start_tick = flow_tick;
+    flow_logo_sweep_wave_phase = (flow_tick * 47 + 113) % 360;
+    flow_logo_sweep_phase = -1;
+    flow_logo_sweep_running = true;
+    flow_logo_recolor_on = true;
+    lv_obj_remove_flag(flow_logo_sweep_mask, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void stop_flow_logo_sweep(void)
+{
+    if (flow_logo_sweep_mask) {
+        lv_obj_add_flag(flow_logo_sweep_mask, LV_OBJ_FLAG_HIDDEN);
+    }
+    flow_logo_sweep_phase = -1;
+    flow_logo_sweep_running = false;
+    flow_logo_recolor_on = false;
 }
 
 static void build_main_flow(lv_obj_t *scr)
@@ -906,6 +1492,15 @@ static void build_main_flow(lv_obj_t *scr)
     lv_obj_add_flag(flow_status_label, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(flow_status_label, LV_OBJ_FLAG_EVENT_BUBBLE);
 
+    flow_status_arrow_label = lv_label_create(main_tile);
+    lv_label_set_text(flow_status_arrow_label, LV_SYMBOL_DOWN);
+    lv_obj_set_style_text_font(flow_status_arrow_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(flow_status_arrow_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_opa(flow_status_arrow_label, LV_OPA_0, 0);
+    lv_obj_align_to(flow_status_arrow_label, flow_status_label, LV_ALIGN_OUT_TOP_MID, 0, 0);
+    lv_obj_add_flag(flow_status_arrow_label, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(flow_status_arrow_label, LV_OBJ_FLAG_EVENT_BUBBLE);
+
     flow_hint_label = lv_label_create(main_tile);
     lv_label_set_text(flow_hint_label, "Waiting for reagent card");
     lv_obj_set_width(flow_hint_label, 330);
@@ -916,6 +1511,8 @@ static void build_main_flow(lv_obj_t *scr)
     lv_obj_align(flow_hint_label, LV_ALIGN_BOTTOM_MID, 0, -70);
     lv_obj_add_flag(flow_hint_label, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(flow_hint_label, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    build_flow_report(main_tile);
 
     flow_timer = lv_timer_create(flow_timer_cb, FLOW_TIMER_PERIOD_MS, NULL);
     set_pass_swipe_lock(true);
@@ -937,6 +1534,13 @@ static void main_tileview_event_cb(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_SCROLL_BEGIN) {
+        if (current_flow_state == TEST_FLOW_WAIT_CARD && flow_wait_card_armed) {
+            disarm_wait_card_ui();
+        }
+        if (flow_phase_label) {
+            lv_label_set_text(flow_phase_label, "");
+        }
+        stop_flow_logo_sweep();
         cancel_flow_stage_restore();
         set_flow_glint_paused(true);
         set_flow_stage_scroll_hidden(true);
@@ -961,21 +1565,14 @@ static void main_flow_click_cb(lv_event_t *e)
     (void)e;
 
     if (current_flow_state == TEST_FLOW_WAIT_CARD && !flow_wait_card_armed) {
-        flow_wait_card_armed = true;
-        test_flow_set_wait_card_enabled(true);
-        lv_obj_remove_flag(flow_status_label, LV_OBJ_FLAG_HIDDEN);
-        last_status_visible = true;
-        update_test_flow_ui();
-        ESP_LOGI(TAG, "Wait-card armed by main flow tap");
+        if ((uint32_t)(lv_tick_get() - last_dim_restore_ms) < WAKE_ARM_GUARD_MS) {
+            return;
+        }
+        arm_wait_card_ui();
         return;
     }
 
-    if (current_flow_state == TEST_FLOW_UPLOAD_REVIEW) {
-        if (test_flow_continue_after_upload_review()) {
-            keep_awake_for(CARD_AWAKE_HOLD_MS);
-            update_test_flow_ui();
-            ESP_LOGI(TAG, "Upload review acknowledged by main flow tap");
-        }
+    if (flow_report_display_state(current_flow_state)) {
         return;
     }
 
@@ -1250,6 +1847,12 @@ static void build_diag_exit_overlay(lv_obj_t *parent)
     lv_obj_center(cancel_label);
 }
 
+static void diag_tileview_scroll_cb(lv_event_t *e)
+{
+    (void)e;
+    ui_wifi_prov_on_move();
+}
+
 static void build_diagnostic(lv_obj_t *scr)
 {
     diagnostic_page = lv_obj_create(scr);
@@ -1262,6 +1865,9 @@ static void build_diagnostic(lv_obj_t *scr)
     lv_obj_set_style_bg_color(tv, lv_color_hex(0x000000), 0);
     lv_obj_set_size(tv, LV_PCT(100), LV_PCT(100));
     lv_obj_set_scrollbar_mode(tv, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_add_event_cb(tv, diag_tileview_scroll_cb, LV_EVENT_SCROLL_BEGIN, NULL);
+    lv_obj_add_event_cb(tv, diag_tileview_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     t_wrap_l = lv_tileview_add_tile(tv, 0, 0, LV_DIR_HOR);
     lv_obj_set_style_bg_color(t_wrap_l, lv_color_hex(0x000000), 0);

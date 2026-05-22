@@ -13,6 +13,7 @@
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "lwip/inet.h"
+#include "esp_task_wdt.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,6 +39,7 @@ static bool s_wifi_started  = false;
 static bool s_handlers_registered = false;
 static bool s_portal_running = false;
 static bool s_sta_connected = false;
+static bool s_sta_reconnect_pending = false;
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data);
 
@@ -216,6 +218,7 @@ static void register_wifi_handlers(void)
     if (s_handlers_registered) return;
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP, wifi_event_handler, NULL);
     s_handlers_registered = true;
 }
 
@@ -395,6 +398,12 @@ static void dns_task(void *arg)
 {
     static const uint8_t AP_IP_BYTES[4] = {192, 168, 4, 1};
 
+    esp_err_t wdt_err = esp_task_wdt_add(NULL);
+    bool wdt_registered = (wdt_err == ESP_OK);
+    if (!wdt_registered) {
+        ESP_LOGW(TAG, "failed to subscribe DNS task to WDT: %s", esp_err_to_name(wdt_err));
+    }
+
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
         ESP_LOGE(TAG, "DNS socket failed");
@@ -425,6 +434,10 @@ static void dns_task(void *arg)
     socklen_t from_len = sizeof(from);
 
     while (s_dns_running) {
+        if (wdt_registered) {
+            esp_task_wdt_reset();
+        }
+
         int len = recvfrom(sock, buf, sizeof(buf), 0,
                            (struct sockaddr *)&from, &from_len);
         if (len < 12) continue; /* timeout or too short */
@@ -467,6 +480,9 @@ static void dns_task(void *arg)
     close(sock);
 done:
     ESP_LOGI(TAG, "DNS task exiting");
+    if (wdt_registered) {
+        esp_task_wdt_delete(NULL);
+    }
     if (s_dns_done_sem) xSemaphoreGive(s_dns_done_sem);
     vTaskDelete(NULL);
 }
@@ -481,12 +497,25 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *d = data;
         ESP_LOGW(TAG, "STA disconnected, reason=%d", d->reason);
+        bool was_connected = s_sta_connected;
         s_sta_connected = false;
         memset(s_got_ip, 0, sizeof(s_got_ip));
-        if (s_state == WIFI_PROV_STATE_CONNECTING) {
+        if (s_sta_reconnect_pending) {
+            s_sta_reconnect_pending = false;
+            s_state = WIFI_PROV_STATE_CONNECTING;
+            ESP_LOGI(TAG, "reconnecting STA");
+            esp_wifi_connect();
+        } else if (s_state == WIFI_PROV_STATE_CONNECTING && s_pending_ssid[0]) {
             s_state = WIFI_PROV_STATE_FAILED;
             /* Revert to AP-only so the HTTP server stays reachable */
             if (s_portal_running) esp_wifi_set_mode(WIFI_MODE_AP);
+        } else if (s_state == WIFI_PROV_STATE_CONNECTING) {
+            ESP_LOGI(TAG, "retrying STA connection");
+            esp_wifi_connect();
+        } else if (was_connected || s_state == WIFI_PROV_STATE_CONNECTED) {
+            s_state = WIFI_PROV_STATE_CONNECTING;
+            ESP_LOGI(TAG, "reconnecting STA after disconnect");
+            esp_wifi_connect();
         }
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *evt = data;
@@ -499,6 +528,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
             memset(s_pending_pass, 0, sizeof(s_pending_pass));
         }
         s_state = WIFI_PROV_STATE_CONNECTED;
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_LOST_IP) {
+        if (s_sta_connected || s_state == WIFI_PROV_STATE_CONNECTED) {
+            ESP_LOGW(TAG, "STA lost IP, reconnecting to refresh DHCP lease");
+            s_sta_connected = false;
+            memset(s_got_ip, 0, sizeof(s_got_ip));
+            s_state = WIFI_PROV_STATE_CONNECTING;
+            s_sta_reconnect_pending = true;
+            esp_wifi_disconnect();
+        }
     }
 }
 
@@ -605,6 +643,7 @@ esp_err_t wifi_prov_stop(void)
         if (s_handlers_registered) {
             esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler);
             esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler);
+            esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_LOST_IP, wifi_event_handler);
             s_handlers_registered = false;
         }
         s_state = WIFI_PROV_STATE_IDLE;
