@@ -786,8 +786,7 @@ const char *test_flow_hint_text(const test_flow_snapshot_t *snapshot)
     }
 
     if (snapshot->state == TEST_FLOW_NFC_ERROR) {
-        snprintf(s_hint, sizeof(s_hint), "NFC failed: %s. Tap to eject", esp_err_to_name(snapshot->last_error));
-        return s_hint;
+        return "NFC error\nTap to eject";
     }
 
     if (snapshot->state == TEST_FLOW_API_ERROR) {

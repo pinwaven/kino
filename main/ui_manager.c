@@ -29,6 +29,7 @@ static lv_obj_t *t6;
 static lv_obj_t *t_wrap_l;
 static lv_obj_t *t_wrap_r;
 static lv_obj_t *overlay;
+static lv_obj_t *overlay_logo_label;
 static lv_obj_t *pass_code_label;
 static lv_obj_t *diag_exit_overlay;
 static lv_obj_t *diag_exit_panel;
@@ -239,11 +240,9 @@ static bool flow_report_display_state(test_flow_state_t state)
     return state == TEST_FLOW_UPLOAD_REVIEW;
 }
 
-static bool flow_large_error_layout(const test_flow_snapshot_t *flow)
+static bool flow_unified_error_layout(const test_flow_snapshot_t *flow)
 {
-    return flow &&
-           flow->state == TEST_FLOW_API_ERROR &&
-           test_flow_uses_large_error_layout(flow->last_error_message);
+    return flow && flow_retryable_error_state(flow->state);
 }
 
 static void summary_value_after(const char *summary, const char *prefix, char *out, size_t out_len)
@@ -458,8 +457,13 @@ static void inactivity_timer_cb(lv_timer_t *t)
         if (flow_phase_label && current_flow_state == TEST_FLOW_WAIT_CARD) {
             lv_label_set_text(flow_phase_label, "");
         }
-        if (main_page && lv_obj_has_flag(main_page, LV_OBJ_FLAG_HIDDEN)) {
+        if (overlay) {
             lv_obj_remove_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(overlay);
+        }
+        if (overlay_logo_label) {
+            bool show_logo = main_page && !lv_obj_has_flag(main_page, LV_OBJ_FLAG_HIDDEN);
+            set_obj_hidden(overlay_logo_label, !show_logo);
         }
         ESP_LOGI(TAG, "Screen dimmed due to %dms inactivity", (int)inactive_time);
     }
@@ -516,7 +520,7 @@ static void update_test_flow_ui(void)
     }
 
     bool report_visible = flow_report_display_state(flow.state);
-    bool status_visible = !flow_large_error_layout(&flow) && !report_visible;
+    bool status_visible = !flow_unified_error_layout(&flow) && !report_visible;
     if (flow.state == TEST_FLOW_WAIT_CARD && !flow_wait_card_armed) status_visible = false;
 
     if (status_visible != last_status_visible) {
@@ -537,7 +541,7 @@ static void update_test_flow_ui(void)
         if (hint_visible) {
             lv_obj_remove_flag(flow_hint_label, LV_OBJ_FLAG_HIDDEN);
             lv_obj_set_width(flow_hint_label, 330);
-            if (flow_large_error_layout(&flow)) {
+            if (flow_unified_error_layout(&flow)) {
                 lv_obj_align(flow_hint_label, LV_ALIGN_CENTER, 0, 104);
             } else {
                 lv_obj_align(flow_hint_label, LV_ALIGN_BOTTOM_MID, 0, -72);
@@ -547,7 +551,7 @@ static void update_test_flow_ui(void)
         }
         last_hint_visible = hint_visible;
     } else if (hint_visible) {
-        if (flow_large_error_layout(&flow)) {
+        if (flow_unified_error_layout(&flow)) {
             lv_obj_align(flow_hint_label, LV_ALIGN_CENTER, 0, 104);
         } else {
             lv_obj_align(flow_hint_label, LV_ALIGN_BOTTOM_MID, 0, -72);
@@ -1980,11 +1984,23 @@ void ui_init(void)
 
     overlay = lv_obj_create(lv_layer_top());
     lv_obj_set_size(overlay, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_opa(overlay, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(overlay, 0, 0);
+    lv_obj_set_style_pad_all(overlay, 0, 0);
     lv_obj_add_flag(overlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(overlay, overlay_event_cb, LV_EVENT_PRESSED, NULL);
+
+    overlay_logo_label = lv_label_create(overlay);
+    lv_label_set_text(overlay_logo_label, "KINO");
+    lv_obj_set_style_text_font(overlay_logo_label, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(overlay_logo_label, lv_color_hex(0x536170), 0);
+    lv_obj_set_style_text_letter_space(overlay_logo_label, 6, 0);
+    lv_obj_set_style_text_opa(overlay_logo_label, LV_OPA_70, 0);
+    lv_obj_align(overlay_logo_label, LV_ALIGN_CENTER, 3, -18);
+    lv_obj_add_flag(overlay_logo_label, LV_OBJ_FLAG_HIDDEN);
 
     lv_timer_create(inactivity_timer_cb, 500, NULL);
     show_main_flow();
