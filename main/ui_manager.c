@@ -457,13 +457,17 @@ static void inactivity_timer_cb(lv_timer_t *t)
         if (flow_phase_label && current_flow_state == TEST_FLOW_WAIT_CARD) {
             lv_label_set_text(flow_phase_label, "");
         }
+        bool main_flow_visible = main_page && !lv_obj_has_flag(main_page, LV_OBJ_FLAG_HIDDEN);
         if (overlay) {
-            lv_obj_remove_flag(overlay, LV_OBJ_FLAG_HIDDEN);
-            lv_obj_move_foreground(overlay);
+            if (main_flow_visible) {
+                lv_obj_remove_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_move_foreground(overlay);
+            } else {
+                lv_obj_add_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+            }
         }
         if (overlay_logo_label) {
-            bool show_logo = main_page && !lv_obj_has_flag(main_page, LV_OBJ_FLAG_HIDDEN);
-            set_obj_hidden(overlay_logo_label, !show_logo);
+            set_obj_hidden(overlay_logo_label, !main_flow_visible);
         }
         ESP_LOGI(TAG, "Screen dimmed due to %dms inactivity", (int)inactive_time);
     }
