@@ -1741,6 +1741,14 @@ static lv_obj_t *diag_normalize_active_tile(lv_obj_t *active_tile)
 static void diag_pointer_event_cb(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
+    if (is_dimmed && code == LV_EVENT_PRESSED) {
+        diag_touch_tracking = false;
+        restore_screen_now();
+        lv_event_stop_bubbling(e);
+        lv_event_stop_processing(e);
+        return;
+    }
+
     lv_indev_t *indev = lv_event_get_indev(e);
     if (!indev) {
         return;
