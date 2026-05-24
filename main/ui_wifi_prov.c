@@ -94,7 +94,8 @@ static void delay_timer_cb(lv_timer_t *timer)
         wifi_prov_status_t st;
         wifi_prov_get_status(&st);
 
-        if ((st.state == WIFI_PROV_STATE_CONNECTED || st.got_ip[0] != '\0') && !s_force_prov) {
+        if (st.state == WIFI_PROV_STATE_CONNECTED || st.got_ip[0] != '\0') {
+            s_force_prov = false;
             show_qr(false);
             lv_label_set_text_fmt(status_label, "Connected to WiFi!\nSSID: %s\nIP: %s", st.target_ssid, st.got_ip);
             lv_obj_set_style_text_color(status_label, lv_color_hex(0x2ECC71), 0);
@@ -151,7 +152,8 @@ static void update_timer_cb(lv_timer_t *timer)
     /* reset text colour first */
     lv_obj_set_style_text_color(status_label, lv_color_hex(0xCCCCCC), 0);
 
-    if ((st.state == WIFI_PROV_STATE_CONNECTED || st.got_ip[0] != '\0') && !s_force_prov) {
+    if (st.state == WIFI_PROV_STATE_CONNECTED || st.got_ip[0] != '\0') {
+        s_force_prov = false;
         show_qr(false);
         lv_label_set_text_fmt(status_label, "Connected to WiFi!\nSSID: %s\nIP: %s", st.target_ssid, st.got_ip);
         lv_obj_set_style_text_color(status_label, lv_color_hex(0x2ECC71), 0);
