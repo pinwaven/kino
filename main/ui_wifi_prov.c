@@ -26,6 +26,10 @@ static bool page_active = false;
 static lv_timer_t *delay_timer = NULL;
 static bool delay_target_active = false;
 
+static bool s_force_prov = false;
+static lv_obj_t *reprov_btn = NULL;
+static lv_obj_t *reprov_btn_label = NULL;
+
 /* ---- prov start/stop tasks (must not block LVGL task) ------------------- */
 
 static bool s_task_pending = false;
@@ -60,6 +64,26 @@ static void show_qr(bool visible)
     }
 }
 
+static void reprov_btn_click_cb(lv_event_t *e)
+{
+    (void)e;
+    s_force_prov = true;
+
+    if (reprov_btn) {
+        lv_obj_add_flag(reprov_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    last_state = (wifi_prov_state_t)(WIFI_PROV_STATE_IDLE - 1); /* force redraw */
+    lv_label_set_text(status_label, "Starting hotspot...");
+    if (!s_task_pending) {
+        s_task_pending = true;
+        if (xTaskCreate(prov_start_task, "prov_start", PROV_START_STACK_BYTES, NULL, 5, NULL) != pdPASS) {
+            ESP_LOGE(TAG, "failed to create prov_start task");
+            s_task_pending = false;
+        }
+    }
+}
+
 static void delay_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -67,19 +91,39 @@ static void delay_timer_cb(lv_timer_t *timer)
     bool active = delay_target_active;
 
     if (active) {
-        last_state = (wifi_prov_state_t)(WIFI_PROV_STATE_IDLE - 1); /* force redraw */
-        lv_timer_resume(update_timer);
-        lv_timer_ready(update_timer);
-        if (!s_task_pending) {
-            s_task_pending = true;
-            if (xTaskCreate(prov_start_task, "prov_start", PROV_START_STACK_BYTES, NULL, 5, NULL) != pdPASS) {
-                ESP_LOGE(TAG, "failed to create prov_start task");
-                s_task_pending = false;
+        wifi_prov_status_t st;
+        wifi_prov_get_status(&st);
+
+        if ((st.state == WIFI_PROV_STATE_CONNECTED || st.got_ip[0] != '\0') && !s_force_prov) {
+            show_qr(false);
+            lv_label_set_text_fmt(status_label, "Connected to WiFi!\nSSID: %s\nIP: %s", st.target_ssid, st.got_ip);
+            lv_obj_set_style_text_color(status_label, lv_color_hex(0x2ECC71), 0);
+            if (reprov_btn) {
+                lv_obj_remove_flag(reprov_btn, LV_OBJ_FLAG_HIDDEN);
+            }
+            last_state = st.state;
+            lv_timer_resume(update_timer);
+        } else {
+            if (reprov_btn) {
+                lv_obj_add_flag(reprov_btn, LV_OBJ_FLAG_HIDDEN);
+            }
+            last_state = (wifi_prov_state_t)(WIFI_PROV_STATE_IDLE - 1); /* force redraw */
+            lv_timer_resume(update_timer);
+            lv_timer_ready(update_timer);
+            if (!s_task_pending) {
+                s_task_pending = true;
+                if (xTaskCreate(prov_start_task, "prov_start", PROV_START_STACK_BYTES, NULL, 5, NULL) != pdPASS) {
+                    ESP_LOGE(TAG, "failed to create prov_start task");
+                    s_task_pending = false;
+                }
             }
         }
     } else {
         lv_timer_pause(update_timer);
         show_qr(false);
+        if (reprov_btn) {
+            lv_obj_add_flag(reprov_btn, LV_OBJ_FLAG_HIDDEN);
+        }
         wifi_prov_status_t st;
         wifi_prov_get_status(&st);
         if (st.state == WIFI_PROV_STATE_IDLE) {
@@ -106,6 +150,20 @@ static void update_timer_cb(lv_timer_t *timer)
 
     /* reset text colour first */
     lv_obj_set_style_text_color(status_label, lv_color_hex(0xCCCCCC), 0);
+
+    if ((st.state == WIFI_PROV_STATE_CONNECTED || st.got_ip[0] != '\0') && !s_force_prov) {
+        show_qr(false);
+        lv_label_set_text_fmt(status_label, "Connected to WiFi!\nSSID: %s\nIP: %s", st.target_ssid, st.got_ip);
+        lv_obj_set_style_text_color(status_label, lv_color_hex(0x2ECC71), 0);
+        if (reprov_btn) {
+            lv_obj_remove_flag(reprov_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+
+    if (reprov_btn) {
+        lv_obj_add_flag(reprov_btn, LV_OBJ_FLAG_HIDDEN);
+    }
 
     switch (st.state) {
     case WIFI_PROV_STATE_IDLE:
@@ -143,6 +201,12 @@ static void update_timer_cb(lv_timer_t *timer)
 void ui_wifi_prov_set_active(bool active)
 {
     page_active = active;
+    if (!active) {
+        s_force_prov = false;
+        if (reprov_btn) {
+            lv_obj_add_flag(reprov_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
     if (!update_timer) return;
 
     if (delay_timer) {
@@ -220,6 +284,20 @@ void ui_wifi_prov_init(lv_obj_t *tile)
     lv_obj_set_width(status_label, 260);
     lv_label_set_long_mode(status_label, LV_LABEL_LONG_WRAP);
     lv_obj_align(status_label, LV_ALIGN_BOTTOM_MID, 0, -28);
+
+    /* Setup WiFi Button (Reconfigure) */
+    reprov_btn = lv_btn_create(tile);
+    lv_obj_set_size(reprov_btn, 180, 44);
+    lv_obj_align(reprov_btn, LV_ALIGN_CENTER, 0, 40);
+    lv_obj_set_style_bg_color(reprov_btn, lv_color_hex(0x2196F3), 0);
+    lv_obj_set_style_radius(reprov_btn, 8, 0);
+    lv_obj_add_flag(reprov_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(reprov_btn, reprov_btn_click_cb, LV_EVENT_CLICKED, NULL);
+
+    reprov_btn_label = lv_label_create(reprov_btn);
+    lv_label_set_text(reprov_btn_label, "Setup WiFi");
+    lv_obj_set_style_text_font(reprov_btn_label, &lv_font_montserrat_16, 0);
+    lv_obj_align(reprov_btn_label, LV_ALIGN_CENTER, 0, 0);
 
     update_timer = lv_timer_create(update_timer_cb, 500, NULL);
     lv_timer_pause(update_timer);
