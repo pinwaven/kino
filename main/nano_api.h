@@ -9,5 +9,6 @@ esp_err_t nano_api_post_mock_biomarkers(void);
 esp_err_t nano_api_post_kino_result(void);
 const char *nano_api_last_error_message(void);
 const char *nano_api_last_upload_summary(void);
+void init_cjson_psram_hooks(void);
 
 #endif

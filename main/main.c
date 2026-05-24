@@ -15,6 +15,7 @@
 #include "bsp/display.h"
 #include "stm32_interface.h"
 #include "ui_app.h"
+#include "nano_api.h"
 
 static const char *TAG = "APP_MAIN";
 
@@ -61,6 +62,7 @@ static void init_nvs_tolerant(void)
 
 void app_main(void)
 {
+    init_cjson_psram_hooks();
     log_boot_info();
     init_nvs_tolerant();
 

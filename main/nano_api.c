@@ -435,3 +435,20 @@ esp_err_t nano_api_post_kino_result(void)
     update_upload_report_summary();
     return err;
 }
+
+static void *cjson_psram_malloc(size_t size) {
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
+static void cjson_psram_free(void *ptr) {
+    heap_caps_free(ptr);
+}
+
+void init_cjson_psram_hooks(void) {
+    cJSON_Hooks hooks = {
+        .malloc_fn = cjson_psram_malloc,
+        .free_fn = cjson_psram_free
+    };
+    cJSON_InitHooks(&hooks);
+    ESP_LOGI(TAG, "cJSON memory hooks configured to use PSRAM");
+}

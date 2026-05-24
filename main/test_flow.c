@@ -32,6 +32,7 @@ static TickType_t s_state_started;
 static SemaphoreHandle_t s_lock;
 static TaskHandle_t s_task;
 static bool s_task_started;
+static bool s_wdt_registered;
 static bool s_motor_mock = true;
 static bool s_wait_card_enabled = true;
 static bool s_motor_action_started;
@@ -406,9 +407,15 @@ static void test_flow_step_locked(void)
 
     if (s_flow.state == TEST_FLOW_GETTING_CHIP) {
         log_stack_watermark("before verify");
+        if (s_task && s_wdt_registered) {
+            esp_task_wdt_delete(NULL);
+        }
         unlock_flow();
         s_flow.last_error = nano_api_get_chip(s_flow.nfc_code);
         lock_flow();
+        if (s_task && s_wdt_registered) {
+            esp_task_wdt_add(NULL);
+        }
         log_stack_watermark("after verify");
         set_last_error_message_locked(nano_api_last_error_message());
         set_state_locked(s_flow.last_error == ESP_OK ? TEST_FLOW_MOCK_TESTING : TEST_FLOW_API_ERROR);
@@ -424,6 +431,9 @@ static void test_flow_step_locked(void)
 
     if (s_flow.state == TEST_FLOW_POSTING_BIOMARKERS) {
         log_stack_watermark("before upload");
+        if (s_task && s_wdt_registered) {
+            esp_task_wdt_delete(NULL);
+        }
         unlock_flow();
         s_flow.last_error = nano_api_post_mock_biomarkers();
         if (s_flow.last_error == ESP_OK) {
@@ -433,6 +443,9 @@ static void test_flow_step_locked(void)
             }
         }
         lock_flow();
+        if (s_task && s_wdt_registered) {
+            esp_task_wdt_add(NULL);
+        }
         log_stack_watermark("after upload");
         set_last_error_message_locked(nano_api_last_error_message());
         set_upload_summary_locked(nano_api_last_upload_summary());
@@ -540,13 +553,13 @@ static void test_flow_task(void *arg)
     (void)arg;
 
     esp_err_t wdt_err = esp_task_wdt_add(NULL);
-    bool wdt_registered = (wdt_err == ESP_OK);
-    if (!wdt_registered) {
+    s_wdt_registered = (wdt_err == ESP_OK);
+    if (!s_wdt_registered) {
         ESP_LOGW(TAG, "failed to subscribe test flow task to WDT: %s", esp_err_to_name(wdt_err));
     }
 
     while (1) {
-        if (wdt_registered) {
+        if (s_wdt_registered) {
             esp_task_wdt_reset();
         }
 

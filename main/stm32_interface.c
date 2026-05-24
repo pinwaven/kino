@@ -44,9 +44,9 @@ static esp_err_t read_resp(char *buffer, uint16_t max_len, uint32_t timeout_ms) 
         if (now >= deadline) break;
 
         TickType_t wait_ticks = len == 0 ? (deadline - now) : pdMS_TO_TICKS(20);
-        int read_len = uart_read_bytes(UART_PORT_NUM, &temp[len], 1, wait_ticks);
-        if (read_len == 1) {
-            len++;
+        int read_len = uart_read_bytes(UART_PORT_NUM, &temp[len], sizeof(temp) - len, wait_ticks);
+        if (read_len > 0) {
+            len += read_len;
             continue;
         }
 
@@ -74,9 +74,9 @@ static esp_err_t read_resp_bytes(uint8_t *buffer, uint16_t max_len, uint16_t *ou
         if (now >= deadline) break;
 
         TickType_t wait_ticks = len == 0 ? (deadline - now) : pdMS_TO_TICKS(20);
-        int read_len = uart_read_bytes(UART_PORT_NUM, &temp[len], 1, wait_ticks);
-        if (read_len == 1) {
-            len++;
+        int read_len = uart_read_bytes(UART_PORT_NUM, &temp[len], sizeof(temp) - len, wait_ticks);
+        if (read_len > 0) {
+            len += read_len;
             continue;
         }
 
@@ -206,6 +206,8 @@ static void parse_motor_poll_response(const char *buf) {
 }
 
 esp_err_t stm32_interface_init(void) {
+    crc_verify_equivalence();
+
     g_mutex = xSemaphoreCreateMutex();
     g_uart_mutex = xSemaphoreCreateMutex();
     memset(&g_state, 0, sizeof(g_state));
