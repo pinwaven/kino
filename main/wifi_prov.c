@@ -40,6 +40,7 @@ static bool s_handlers_registered = false;
 static bool s_portal_running = false;
 static bool s_sta_connected = false;
 static bool s_sta_reconnect_pending = false;
+static volatile bool s_disconnecting_for_reprovision = false;
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data);
 
@@ -290,6 +291,11 @@ static esp_err_t handler_connect(httpd_req_t *req)
         return ESP_OK;
     }
 
+    if (s_sta_connected) {
+        s_disconnecting_for_reprovision = true;
+        esp_wifi_disconnect();
+    }
+
     strncpy(s_target_ssid, ssid, sizeof(s_target_ssid) - 1);
     strncpy(s_pending_ssid, ssid, sizeof(s_pending_ssid) - 1);
     strncpy(s_pending_pass, pass, sizeof(s_pending_pass) - 1);
@@ -500,6 +506,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         bool was_connected = s_sta_connected;
         s_sta_connected = false;
         memset(s_got_ip, 0, sizeof(s_got_ip));
+        if (s_disconnecting_for_reprovision) {
+            s_disconnecting_for_reprovision = false;
+            ESP_LOGI(TAG, "ignored explicit disconnect for reprovisioning");
+            return;
+        }
         if (s_sta_reconnect_pending) {
             s_sta_reconnect_pending = false;
             s_state = WIFI_PROV_STATE_CONNECTING;
