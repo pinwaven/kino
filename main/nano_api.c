@@ -437,7 +437,11 @@ esp_err_t nano_api_post_kino_result(void)
 }
 
 static void *cjson_psram_malloc(size_t size) {
-    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ptr) {
+        ptr = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    return ptr;
 }
 
 static void cjson_psram_free(void *ptr) {

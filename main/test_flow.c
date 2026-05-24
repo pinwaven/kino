@@ -42,6 +42,28 @@ static TickType_t s_wait_card_enabled_tick;
 static uint8_t s_card_detect_fail_count;
 static uint8_t s_consecutive_card_count;
 
+static void wdt_detach_self(void) {
+    if (s_wdt_registered) {
+        esp_err_t err = esp_task_wdt_delete(NULL);
+        if (err == ESP_OK) {
+            s_wdt_registered = false;
+        } else {
+            ESP_LOGW(TAG, "failed to delete task from WDT: %s", esp_err_to_name(err));
+        }
+    }
+}
+
+static void wdt_restore_self(void) {
+    if (!s_wdt_registered) {
+        esp_err_t err = esp_task_wdt_add(NULL);
+        if (err == ESP_OK) {
+            s_wdt_registered = true;
+        } else {
+            ESP_LOGE(TAG, "failed to re-subscribe task to WDT: %s", esp_err_to_name(err));
+        }
+    }
+}
+
 typedef enum {
     MOTOR_OP_HOMING,
     MOTOR_OP_OPEN,
@@ -407,15 +429,11 @@ static void test_flow_step_locked(void)
 
     if (s_flow.state == TEST_FLOW_GETTING_CHIP) {
         log_stack_watermark("before verify");
-        if (s_task && s_wdt_registered) {
-            esp_task_wdt_delete(NULL);
-        }
+        wdt_detach_self();
         unlock_flow();
         s_flow.last_error = nano_api_get_chip(s_flow.nfc_code);
         lock_flow();
-        if (s_task && s_wdt_registered) {
-            esp_task_wdt_add(NULL);
-        }
+        wdt_restore_self();
         log_stack_watermark("after verify");
         set_last_error_message_locked(nano_api_last_error_message());
         set_state_locked(s_flow.last_error == ESP_OK ? TEST_FLOW_MOCK_TESTING : TEST_FLOW_API_ERROR);
@@ -431,9 +449,7 @@ static void test_flow_step_locked(void)
 
     if (s_flow.state == TEST_FLOW_POSTING_BIOMARKERS) {
         log_stack_watermark("before upload");
-        if (s_task && s_wdt_registered) {
-            esp_task_wdt_delete(NULL);
-        }
+        wdt_detach_self();
         unlock_flow();
         s_flow.last_error = nano_api_post_mock_biomarkers();
         if (s_flow.last_error == ESP_OK) {
@@ -443,9 +459,7 @@ static void test_flow_step_locked(void)
             }
         }
         lock_flow();
-        if (s_task && s_wdt_registered) {
-            esp_task_wdt_add(NULL);
-        }
+        wdt_restore_self();
         log_stack_watermark("after upload");
         set_last_error_message_locked(nano_api_last_error_message());
         set_upload_summary_locked(nano_api_last_upload_summary());
