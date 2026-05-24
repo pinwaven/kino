@@ -206,7 +206,9 @@ static void parse_motor_poll_response(const char *buf) {
 }
 
 esp_err_t stm32_interface_init(void) {
+#if ENABLE_CRC_EQUIVALENCE_TEST
     crc_verify_equivalence();
+#endif
 
     g_mutex = xSemaphoreCreateMutex();
     g_uart_mutex = xSemaphoreCreateMutex();

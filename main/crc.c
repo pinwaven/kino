@@ -1,7 +1,9 @@
 #include "crc.h"
 #include "esp_log.h"
 
+#if ENABLE_CRC_EQUIVALENCE_TEST
 static const char *TAG = "CRC";
+#endif
 
 static const uint8_t crc8_table[256] = {
     0x00, 0x07, 0x0E, 0x09, 0x1C, 0x1B, 0x12, 0x15, 0x38, 0x3F, 0x36, 0x31, 0x24, 0x23, 0x2A, 0x2D,
@@ -37,6 +39,7 @@ uint8_t cal_crc8(const uint8_t *data, uint16_t len) {
     return crc;
 }
 
+#if ENABLE_CRC_EQUIVALENCE_TEST
 static uint8_t cal_crc8_math(const uint8_t *data, uint16_t len) {
     uint8_t crc = 0x00;
     for (uint16_t i = 0; i < len; i++) {
@@ -66,3 +69,4 @@ bool crc_verify_equivalence(void) {
     ESP_LOGI(TAG, "CRC Equivalence verification PASSED for all 256 byte values!");
     return true;
 }
+#endif
