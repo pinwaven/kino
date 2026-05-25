@@ -238,10 +238,10 @@ static void power_worker_task(void *arg)
             esp_pm_lock_acquire(s_light_sleep_lock);
             s_pm_lock_held = true;
             ESP_LOGI(TAG, "Acquired PM lock, preventing ESP32 Light Sleep");
-
-            ESP_LOGI(TAG, "Resuming Wi-Fi radio on wakeup");
-            wifi_prov_resume_radio();
         }
+
+        ESP_LOGI(TAG, "Resuming Wi-Fi radio on wakeup");
+        wifi_prov_resume_radio();
 
         if (sleep_command_sent) {
             ESP_LOGI(TAG, "Waking up STM32 after sleep");
