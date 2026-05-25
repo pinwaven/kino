@@ -25,6 +25,8 @@ typedef struct {
 esp_err_t wifi_prov_start(void);
 esp_err_t wifi_prov_stop(void);
 esp_err_t wifi_prov_auto_connect_saved(void);
+esp_err_t wifi_prov_pause_radio(void);
+esp_err_t wifi_prov_resume_radio(void);
 void wifi_prov_get_status(wifi_prov_status_t *out);
 
 #endif // WIFI_PROV_H

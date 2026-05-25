@@ -10,7 +10,6 @@
 #include "freertos/task.h"
 #include "esp_pm.h"
 #include "esp_sleep.h"
-#include "esp_wifi.h"
 #include "driver/gpio.h"
 #include <stdio.h>
 #include <string.h>
@@ -219,8 +218,8 @@ static void power_worker_task(void *arg)
                 sleep_command_sent = true;
                 ESP_LOGI(TAG, "Sleep command sent to STM32 successfully");
 
-                ESP_LOGI(TAG, "Stopping Wi-Fi radio for deep sleep");
-                esp_wifi_stop();
+                ESP_LOGI(TAG, "Pausing Wi-Fi radio for deep sleep");
+                wifi_prov_pause_radio();
 
                 /*
                  * Keep ESP32 light sleep locked while the display is dimmed.
@@ -240,14 +239,8 @@ static void power_worker_task(void *arg)
             s_pm_lock_held = true;
             ESP_LOGI(TAG, "Acquired PM lock, preventing ESP32 Light Sleep");
 
-            ESP_LOGI(TAG, "Starting Wi-Fi radio on wakeup");
-            esp_err_t start_err = esp_wifi_start();
-            if (start_err == ESP_OK) {
-                ESP_LOGI(TAG, "Triggering Wi-Fi reconnection");
-                esp_wifi_connect();
-            } else {
-                ESP_LOGE(TAG, "Failed to start Wi-Fi radio: %s", esp_err_to_name(start_err));
-            }
+            ESP_LOGI(TAG, "Resuming Wi-Fi radio on wakeup");
+            wifi_prov_resume_radio();
         }
 
         if (sleep_command_sent) {

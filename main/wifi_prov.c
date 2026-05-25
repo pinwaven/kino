@@ -41,6 +41,7 @@ static bool s_handlers_registered = false;
 static bool s_portal_running = false;
 static bool s_sta_connected = false;
 static bool s_sta_reconnect_pending = false;
+static bool s_radio_paused = false;
 static volatile bool s_disconnecting_for_reprovision = false;
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data);
@@ -507,6 +508,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         bool was_connected = s_sta_connected;
         s_sta_connected = false;
         memset(s_got_ip, 0, sizeof(s_got_ip));
+        if (s_radio_paused) {
+            ESP_LOGI(TAG, "ignored disconnect while radio is paused");
+            return;
+        }
         if (s_disconnecting_for_reprovision) {
             s_disconnecting_for_reprovision = false;
             ESP_LOGI(TAG, "ignored explicit disconnect for reprovisioning");
@@ -673,7 +678,7 @@ esp_err_t wifi_prov_stop(void)
 
 esp_err_t wifi_prov_auto_connect_saved(void)
 {
-    if (s_state != WIFI_PROV_STATE_IDLE || s_starting || s_wifi_started) {
+    if (s_state != WIFI_PROV_STATE_IDLE || s_starting) {
         return ESP_OK;
     }
 
@@ -718,6 +723,61 @@ esp_err_t wifi_prov_auto_connect_saved(void)
 
     s_starting = false;
     return ret;
+}
+
+esp_err_t wifi_prov_pause_radio(void)
+{
+    if (!s_wifi_started || s_radio_paused) {
+        return ESP_OK;
+    }
+    if (s_portal_running) {
+        ESP_LOGI(TAG, "skip radio pause while provisioning portal is active");
+        return ESP_OK;
+    }
+
+    s_radio_paused = true;
+    s_sta_connected = false;
+    s_sta_reconnect_pending = false;
+    memset(s_got_ip, 0, sizeof(s_got_ip));
+    if (s_state == WIFI_PROV_STATE_CONNECTED || s_state == WIFI_PROV_STATE_CONNECTING) {
+        s_state = WIFI_PROV_STATE_IDLE;
+    }
+
+    esp_err_t ret = esp_wifi_stop();
+    if (ret == ESP_ERR_WIFI_NOT_STARTED) {
+        ret = ESP_OK;
+    }
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "WiFi radio paused");
+    } else {
+        ESP_LOGW(TAG, "WiFi radio pause failed: %s", esp_err_to_name(ret));
+        s_radio_paused = false;
+    }
+    return ret;
+}
+
+esp_err_t wifi_prov_resume_radio(void)
+{
+    if (s_portal_running) {
+        return ESP_OK;
+    }
+
+    if (s_radio_paused) {
+        s_radio_paused = false;
+        if (s_wifi_started) {
+            esp_err_t ret = esp_wifi_start();
+            if (ret != ESP_OK && ret != ESP_ERR_WIFI_CONN) {
+                ESP_LOGW(TAG, "WiFi radio resume failed: %s", esp_err_to_name(ret));
+                return ret;
+            }
+        }
+    }
+
+    s_state = WIFI_PROV_STATE_IDLE;
+    s_sta_connected = false;
+    s_sta_reconnect_pending = false;
+    memset(s_got_ip, 0, sizeof(s_got_ip));
+    return wifi_prov_auto_connect_saved();
 }
 
 
