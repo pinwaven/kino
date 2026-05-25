@@ -1,6 +1,7 @@
 #include "ui_app.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_flash.h"
 #include "esp_timer.h"
@@ -14,6 +15,7 @@
 #include <string.h>
 
 static lv_obj_t *lbl_heap;
+static lv_obj_t *lbl_version;
 static lv_obj_t *lbl_psram;
 static lv_obj_t *lbl_uptime;
 static lv_obj_t *lbl_flash;
@@ -22,7 +24,6 @@ static lv_obj_t *lbl_cpu_core1;
 static lv_obj_t *lbl_cpu_freq;
 static lv_obj_t *lbl_freq_dist;
 static lv_obj_t *lbl_temp;
-static lv_obj_t *spinner; 
 static lv_timer_t *update_timer;
 static temperature_sensor_handle_t temp_sensor;
 static bool temp_sensor_init_attempted;
@@ -38,6 +39,15 @@ static size_t freq_sample_pos;
 static size_t freq_sample_count;
 static int64_t prev_pm_time_us[3];
 static bool prev_pm_time_valid;
+
+static const char *app_version_string(void)
+{
+    const esp_app_desc_t *desc = esp_app_get_description();
+    if (desc && desc->version[0] != '\0') {
+        return desc->version;
+    }
+    return __DATE__ " " __TIME__;
+}
 
 static size_t cpu_freq_bin(uint32_t freq_mhz)
 {
@@ -275,19 +285,16 @@ void ui_sys_stats_init(lv_obj_t *tile) {
     lv_obj_set_style_pad_gap(cont, 5, 0);
     lv_obj_clear_flag(cont, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Title
+    lbl_version = lv_label_create(cont);
+    lv_label_set_text_fmt(lbl_version, "VER: %s", app_version_string());
+    lv_obj_set_style_text_font(lbl_version, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(lbl_version, lv_color_hex(0x95A5A6), 0);
+
     lv_obj_t *title = lv_label_create(cont);
     lv_label_set_text(title, "SYSTEM MONITOR");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0x3498DB), 0);
     lv_obj_set_style_margin_bottom(title, 5, 0);
-
-    // Spinner for load visualization
-    spinner = lv_spinner_create(cont);
-    lv_obj_set_size(spinner, 30, 30);
-    lv_obj_set_style_arc_width(spinner, 5, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(spinner, 5, LV_PART_INDICATOR);
-    lv_obj_set_style_margin_bottom(spinner, 5, 0);
 
     // Static info
     uint32_t flash_size; esp_flash_get_size(NULL, &flash_size);
@@ -337,11 +344,9 @@ void ui_sys_stats_init(lv_obj_t *tile) {
 void ui_sys_stats_set_active(bool active) {
     if (active) {
         lv_timer_resume(update_timer);
-        lv_obj_remove_flag(spinner, LV_OBJ_FLAG_HIDDEN);
         reset_cpu_freq_distribution();
         update_stats(update_timer);
     } else {
         lv_timer_pause(update_timer);
-        lv_obj_add_flag(spinner, LV_OBJ_FLAG_HIDDEN);
     }
 }

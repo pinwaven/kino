@@ -16,23 +16,25 @@
 
 #define DIAG_PASSCODE "123"
 #define DIAG_PASSCODE_LEN 3
+#define DIAG_LONG_PRESS_MS 3140
+#define DIAG_LONG_PRESS_FEEDBACK_MS 1000
+#define DIAG_LONG_PRESS_TICK_MS 50
 
 static const char *TAG = "UI_MANAGER";
 
 static lv_obj_t *main_page;
 static lv_obj_t *diagnostic_page;
-static lv_obj_t *main_tv;
 static lv_obj_t *main_tile;
 static lv_obj_t *pass_tile;
 static lv_obj_t *tv;
+static lv_obj_t *t_wrap_l;
+static lv_obj_t *t_wrap_r;
 static lv_obj_t *t1;
 static lv_obj_t *t2;
 static lv_obj_t *t3;
 static lv_obj_t *t4;
 static lv_obj_t *t5;
 static lv_obj_t *t6;
-static lv_obj_t *t_wrap_l;
-static lv_obj_t *t_wrap_r;
 static lv_obj_t *overlay;
 static lv_obj_t *overlay_logo_label;
 static lv_obj_t *pass_code_label;
@@ -40,8 +42,6 @@ static lv_obj_t *diag_exit_overlay;
 static lv_obj_t *diag_exit_panel;
 static lv_obj_t *diag_exit_btn;
 static lv_obj_t *diag_cancel_btn;
-static lv_obj_t *diag_loop_fx_overlay;
-static lv_obj_t *diag_loop_fx_bar;
 static lv_point_t diag_touch_start;
 static bool diag_touch_tracking = false;
 
@@ -84,10 +84,8 @@ static lv_obj_t *flow_report_tap_hitbox;
 static lv_obj_t *flow_report_tap_label;
 static int flow_report_page;
 static lv_timer_t *flow_timer;
-static lv_timer_t *flow_stage_restore_timer;
 static int flow_tick;
 static bool flow_timer_slow = false;
-static bool pass_swipe_locked = false;
 static test_flow_state_t last_visual_state = (test_flow_state_t)-1;
 static bool last_visual_dimmed = false;
 static bool last_hint_visible = false;
@@ -97,6 +95,11 @@ static bool flow_render_paused = false;
 static bool flow_wait_card_armed = false;
 static bool flow_glint_paused = false;
 static bool flow_stage_scroll_hidden = false;
+static lv_timer_t *diag_long_press_timer;
+static bool diag_long_press_tracking;
+static bool diag_long_press_fired;
+static bool diag_long_press_feedback;
+static uint32_t diag_long_press_start_ms;
 
 static bool is_dimmed = false;
 static bool allow_auto_dim = true;
@@ -104,7 +107,7 @@ static bool s_in_diagnostic = false;
 static uint32_t last_dim_restore_ms;
 static const int BRIGHTNESS_NORMAL = 66;
 static const int BRIGHTNESS_DIMMED = 20;
-static const uint32_t INACTIVITY_TIMEOUT_MS = 10000;
+static const uint32_t INACTIVITY_TIMEOUT_MS = 20000;
 static const uint32_t WAKE_ARM_GUARD_MS = 500;
 static const uint32_t INSERT_CARD_TIMEOUT_MS = 30000;
 static const uint32_t ERROR_INACTIVITY_TIMEOUT_MS = 30000;
@@ -141,12 +144,7 @@ static volatile bool sleep_command_sent = false;
 static esp_pm_lock_handle_t s_light_sleep_lock = NULL;
 static volatile bool s_pm_lock_held = true;
 
-typedef enum {
-    POWER_WORKER_SLEEP,
-    POWER_WORKER_WAKE,
-} power_worker_req_t;
-
-static QueueHandle_t s_power_worker_queue = NULL;
+static QueueHandle_t s_sys_worker_queue = NULL;
 static volatile bool s_sleep_request_pending = false;
 static volatile bool s_wake_request_pending = false;
 static volatile bool s_wake_sequence_active = false;
@@ -157,8 +155,9 @@ static void show_main_flow(void);
 static void show_diagnostic(void);
 static void main_flow_press_cb(lv_event_t *e);
 static void main_flow_click_cb(lv_event_t *e);
-static void main_tileview_event_cb(lv_event_t *e);
-static void set_pass_swipe_lock(bool locked);
+static void diag_long_press_timer_cb(lv_timer_t *timer);
+static void cancel_diag_long_press(void);
+static void set_diag_long_press_feedback(bool active);
 static void disarm_wait_card_ui(void);
 static bool arm_wait_card_ui(void);
 static bool flow_retryable_error_state(test_flow_state_t state);
@@ -175,117 +174,157 @@ static void report_metric_click_cb(lv_event_t *e);
 static void report_eject_click_cb(lv_event_t *e);
 static void set_flow_glint_paused(bool paused);
 static void set_flow_stage_scroll_hidden(bool hidden);
-static void schedule_flow_stage_restore(void);
-static void cancel_flow_stage_restore(void);
 static void diag_pointer_event_cb(lv_event_t *e);
 static void diag_exit_overlay_hide(void);
 static void diag_exit_overlay_show(void);
 static lv_obj_t *diag_normalize_active_tile(lv_obj_t *active_tile);
-static void diag_loop_fx_play(bool from_left);
 
-static bool queue_power_request(power_worker_req_t req)
+bool sys_worker_send_req(sys_worker_req_t req)
 {
-    volatile bool *pending = req == POWER_WORKER_SLEEP ? &s_sleep_request_pending : &s_wake_request_pending;
-
-    if (!s_power_worker_queue) {
-        ESP_LOGW(TAG, "power worker queue unavailable");
+    if (!s_sys_worker_queue) {
+        ESP_LOGW(TAG, "sys worker queue unavailable");
         return false;
     }
-    if (*pending) {
+
+    volatile bool *pending = NULL;
+    if (req == SYS_WORKER_SLEEP) {
+        pending = &s_sleep_request_pending;
+    } else if (req == SYS_WORKER_WAKE) {
+        pending = &s_wake_request_pending;
+    }
+
+    if (pending) {
+        if (*pending) {
+            return true;
+        }
+        *pending = true;
+    }
+
+    if (xQueueSend(s_sys_worker_queue, &req, 0) == pdTRUE) {
         return true;
     }
 
-    *pending = true;
-    if (xQueueSend(s_power_worker_queue, &req, 0) == pdTRUE) {
-        return true;
+    if (pending) {
+        *pending = false;
     }
-
-    *pending = false;
-    ESP_LOGW(TAG, "power worker queue full");
+    ESP_LOGW(TAG, "sys worker queue full for request %d", req);
     return false;
 }
 
-static void power_worker_task(void *arg)
+static void sys_worker_task(void *arg)
 {
     (void)arg;
-    power_worker_req_t req;
+    sys_worker_req_t req;
 
-    while (xQueueReceive(s_power_worker_queue, &req, portMAX_DELAY) == pdTRUE) {
-        if (req == POWER_WORKER_SLEEP) {
-            ESP_LOGI(TAG, "Sending sleep command to STM32");
-            esp_err_t err = stm32_cmd_send_action(CMD_SLEEP, NULL, 0);
-            if (err == ESP_OK) {
-                sleep_command_sent = true;
-                ESP_LOGI(TAG, "Sleep command sent to STM32 successfully");
+    while (xQueueReceive(s_sys_worker_queue, &req, portMAX_DELAY) == pdTRUE) {
+        switch (req) {
+            case SYS_WORKER_SLEEP: {
+                ESP_LOGI(TAG, "Sending sleep command to STM32");
+                esp_err_t err = stm32_cmd_send_action(CMD_SLEEP, NULL, 0);
+                if (err == ESP_OK) {
+                    sleep_command_sent = true;
+                    ESP_LOGI(TAG, "Sleep command sent to STM32 successfully");
 
-                ESP_LOGI(TAG, "Pausing Wi-Fi radio for deep sleep");
-                wifi_prov_pause_radio();
-
-                /*
-                 * Keep ESP32 light sleep locked while the display is dimmed.
-                 * Releasing it here can let the CPU go back to sleep between the
-                 * touch wake event and the UI/worker wake path, which can leave
-                 * the AMOLED black with no task-WDT panic.
-                 */
-            } else {
-                ESP_LOGE(TAG, "Failed to send sleep command to STM32: %s", esp_err_to_name(err));
-            }
-            s_sleep_request_pending = false;
-            continue;
-        }
-
-        if (s_light_sleep_lock && !s_pm_lock_held) {
-            esp_pm_lock_acquire(s_light_sleep_lock);
-            s_pm_lock_held = true;
-            ESP_LOGI(TAG, "Acquired PM lock, preventing ESP32 Light Sleep");
-        }
-
-        if (sleep_command_sent) {
-            ESP_LOGI(TAG, "Waking up STM32 after sleep");
-            s_wake_sequence_active = true;
-            int success_count = 0;
-            char resp_buf[64];
-
-            for (int retry = 0; retry < WAKE_HI_MAX_ATTEMPTS && success_count < WAKE_HI_REQUIRED_SUCCESSES; retry++) {
-                ESP_LOGI(TAG,
-                         "Sending CMD_HI to wake up (attempt %d/%d success %d/%d)",
-                         retry + 1,
-                         WAKE_HI_MAX_ATTEMPTS,
-                         success_count,
-                         WAKE_HI_REQUIRED_SUCCESSES);
-                esp_err_t err = stm32_cmd_request_timeout(CMD_HI, NULL, 0, resp_buf, sizeof(resp_buf), 150);
-                if (err == ESP_OK && strncmp(resp_buf, "ver:", 4) == 0) {
-                    success_count++;
-                    ESP_LOGI(TAG, "STM32 wake HI ok %d/%d, response: %s",
-                             success_count,
-                             WAKE_HI_REQUIRED_SUCCESSES,
-                             resp_buf);
+                    ESP_LOGI(TAG, "Pausing Wi-Fi radio for deep sleep");
+                    wifi_prov_pause_radio();
                 } else {
-                    success_count = 0;
+                    ESP_LOGE(TAG, "Failed to send sleep command to STM32: %s", esp_err_to_name(err));
                 }
-
-                if (success_count < WAKE_HI_REQUIRED_SUCCESSES) {
-                    vTaskDelay(pdMS_TO_TICKS(WAKE_HI_GAP_MS));
-                }
+                s_sleep_request_pending = false;
+                break;
             }
 
-            if (success_count >= WAKE_HI_REQUIRED_SUCCESSES) {
-                vTaskDelay(pdMS_TO_TICKS(WAKE_READY_SETTLE_MS));
-                sleep_command_sent = false;
-                ESP_LOGI(TAG, "STM32 wake confirmed by %d HI responses", success_count);
-            } else {
-                ESP_LOGE(TAG,
-                         "Failed to wake up STM32 after %d attempts with %d required HI responses",
-                         WAKE_HI_MAX_ATTEMPTS,
-                         WAKE_HI_REQUIRED_SUCCESSES);
-                test_flow_trigger_external_error(TEST_FLOW_CARD_DETECT_ERROR, "awake mcu failed\nreboot please..");
+            case SYS_WORKER_WAKE: {
+                if (s_light_sleep_lock && !s_pm_lock_held) {
+                    esp_pm_lock_acquire(s_light_sleep_lock);
+                    s_pm_lock_held = true;
+                    ESP_LOGI(TAG, "Acquired PM lock, preventing ESP32 Light Sleep");
+                }
+
+                if (sleep_command_sent) {
+                    ESP_LOGI(TAG, "Waking up STM32 after sleep");
+                    s_wake_sequence_active = true;
+                    int success_count = 0;
+                    char resp_buf[64];
+
+                    for (int retry = 0; retry < WAKE_HI_MAX_ATTEMPTS && success_count < WAKE_HI_REQUIRED_SUCCESSES; retry++) {
+                        ESP_LOGI(TAG,
+                                 "Sending CMD_HI to wake up (attempt %d/%d success %d/%d)",
+                                 retry + 1,
+                                 WAKE_HI_MAX_ATTEMPTS,
+                                 success_count,
+                                 WAKE_HI_REQUIRED_SUCCESSES);
+                        esp_err_t err = stm32_cmd_request_timeout(CMD_HI, NULL, 0, resp_buf, sizeof(resp_buf), 150);
+                        if (err == ESP_OK && strncmp(resp_buf, "ver:", 4) == 0) {
+                            success_count++;
+                            ESP_LOGI(TAG, "STM32 wake HI ok %d/%d, response: %s",
+                                     success_count,
+                                     WAKE_HI_REQUIRED_SUCCESSES,
+                                     resp_buf);
+                        } else {
+                            success_count = 0;
+                        }
+
+                        if (success_count < WAKE_HI_REQUIRED_SUCCESSES) {
+                            vTaskDelay(pdMS_TO_TICKS(WAKE_HI_GAP_MS));
+                        }
+                    }
+
+                    if (success_count >= WAKE_HI_REQUIRED_SUCCESSES) {
+                        vTaskDelay(pdMS_TO_TICKS(WAKE_READY_SETTLE_MS));
+                        sleep_command_sent = false;
+                        ESP_LOGI(TAG, "STM32 wake confirmed by %d HI responses", success_count);
+                    } else {
+                        ESP_LOGE(TAG,
+                                 "Failed to wake up STM32 after %d attempts with %d required HI responses",
+                                 WAKE_HI_MAX_ATTEMPTS,
+                                 WAKE_HI_REQUIRED_SUCCESSES);
+                        test_flow_trigger_external_error(TEST_FLOW_CARD_DETECT_ERROR, "awake mcu failed\nreboot please..");
+                    }
+                    s_wake_sequence_active = false;
+                }
+
+                ESP_LOGI(TAG, "Resuming Wi-Fi radio after STM32 wake");
+                wifi_prov_resume_radio();
+                s_wake_request_pending = false;
+                break;
             }
-            s_wake_sequence_active = false;
+
+            case SYS_WORKER_WIFI_AUTO_CONNECT: {
+                wifi_prov_auto_connect_saved();
+                break;
+            }
+
+            case SYS_WORKER_PROV_START: {
+                esp_err_t err = wifi_prov_start();
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "prov start failed: %s", esp_err_to_name(err));
+                }
+                if (ui_wifi_prov_get_stop_after_task() || !ui_wifi_prov_is_page_active()) {
+                    wifi_prov_stop();
+                    ui_wifi_prov_clear_stop_after_task();
+                }
+                ui_wifi_prov_clear_task_pending();
+                break;
+            }
+
+            case SYS_WORKER_PROV_STOP: {
+                ui_wifi_prov_clear_stop_after_task();
+                wifi_prov_stop();
+                ui_wifi_prov_clear_task_pending();
+                break;
+            }
+
+            case SYS_WORKER_BMS_POLL: {
+                esp_err_t err = stm32_update_bmsinfo();
+                ui_standby_set_bms_err(err);
+                ui_standby_clear_bms_pending();
+                break;
+            }
+
+            default:
+                break;
         }
-
-        ESP_LOGI(TAG, "Resuming Wi-Fi radio after STM32 wake");
-        wifi_prov_resume_radio();
-        s_wake_request_pending = false;
     }
 }
 
@@ -309,12 +348,7 @@ static void update_overlay_logo_idle_motion(void)
     lv_obj_set_style_text_opa(overlay_logo_label, opa, 0);
 }
 
-static void wifi_auto_connect_task(void *arg)
-{
-    (void)arg;
-    wifi_prov_auto_connect_saved();
-    vTaskDelete(NULL);
-}
+
 
 static void flow_pause_render(void)
 {
@@ -365,18 +399,15 @@ static void restore_screen_now(void)
             lv_obj_align(overlay_logo_label, LV_ALIGN_CENTER, 3, -18);
         }
         if (sleep_command_sent || s_sleep_request_pending || !s_pm_lock_held) {
-            queue_power_request(POWER_WORKER_WAKE);
+            sys_worker_send_req(SYS_WORKER_WAKE);
         }
-        if (main_tv && lv_tileview_get_tile_active(main_tv) == main_tile) {
-            cancel_flow_stage_restore();
-            set_flow_stage_scroll_hidden(false);
-            if (current_flow_state == TEST_FLOW_WAIT_CARD) {
-                disarm_wait_card_ui();
-                update_flow_stage_visuals(current_flow_state);
-                update_flow_logo_effect(current_flow_state);
-            } else if (flow_retryable_error_state(current_flow_state)) {
-                set_flow_glint_paused(false);
-            }
+        set_flow_stage_scroll_hidden(false);
+        if (current_flow_state == TEST_FLOW_WAIT_CARD) {
+            disarm_wait_card_ui();
+            update_flow_stage_visuals(current_flow_state);
+            update_flow_logo_effect(current_flow_state);
+        } else if (flow_retryable_error_state(current_flow_state)) {
+            set_flow_glint_paused(false);
         }
         if (flow_timer) {
             lv_timer_set_period(flow_timer, FLOW_TIMER_PERIOD_MS);
@@ -583,7 +614,7 @@ static void inactivity_timer_cb(lv_timer_t *t)
                     lv_obj_set_style_text_color(overlay_logo_label, lv_color_hex(OVERLAY_LOGO_IDLE_COLOR), 0);
                     lv_obj_set_style_text_opa(overlay_logo_label, OVERLAY_LOGO_IDLE_OPA, 0);
                 }
-                queue_power_request(POWER_WORKER_SLEEP);
+                sys_worker_send_req(SYS_WORKER_SLEEP);
             }
         }
     }
@@ -616,10 +647,8 @@ static void inactivity_timer_cb(lv_timer_t *t)
         if (insert_card_wait_until_ms != 0 &&
             (int32_t)(insert_card_wait_until_ms - lv_tick_get()) <= 0) {
             disarm_wait_card_ui();
-            lv_display_trigger_activity(NULL);
             ESP_LOGI(TAG, "Insert-card wait timed out after %ums", (unsigned)INSERT_CARD_TIMEOUT_MS);
         } else {
-            lv_display_trigger_activity(NULL);
             return;
         }
     }
@@ -629,7 +658,6 @@ static void inactivity_timer_cb(lv_timer_t *t)
                            INACTIVITY_TIMEOUT_MS;
 
     if (inactive_time >= dim_timeout && !is_dimmed) {
-        cancel_flow_stage_restore();
         if (flow_retryable_error_state(current_flow_state)) {
             set_flow_glint_paused(true);
         } else {
@@ -694,7 +722,6 @@ static void update_test_flow_ui(void)
 
     test_flow_get_snapshot(&flow);
     current_flow_state = flow.state;
-    set_pass_swipe_lock(flow.state != TEST_FLOW_WAIT_CARD);
 
     if (flow_network_busy_state(flow.state)) {
         flow_pause_render();
@@ -713,6 +740,9 @@ static void update_test_flow_ui(void)
     }
 
     status_text = test_flow_status_text(flow.state);
+    if (flow.state == TEST_FLOW_WAIT_CARD && !flow_wait_card_armed) {
+        status_text = "Ready";
+    }
     hint_text = test_flow_hint_text(&flow);
     hint_color = flow_retryable_error_state(flow.state) ? lv_color_hex(0xFF6B6B) :
                  flow.state == TEST_FLOW_UPLOAD_REVIEW ? lv_color_hex(0xFFD166) :
@@ -725,7 +755,9 @@ static void update_test_flow_ui(void)
 
     bool report_visible = flow_report_display_state(flow.state);
     bool status_visible = !flow_unified_error_layout(&flow) && !report_visible;
-    if (flow.state == TEST_FLOW_WAIT_CARD && !flow_wait_card_armed) status_visible = false;
+    if (flow.state == TEST_FLOW_WAIT_CARD && !flow_wait_card_armed) {
+        status_visible = false;
+    }
 
     if (status_visible != last_status_visible) {
         if (status_visible) {
@@ -792,17 +824,6 @@ static void update_test_flow_ui(void)
     last_flow_state = flow.state;
 }
 
-static void set_pass_swipe_lock(bool locked)
-{
-    if (!main_tv || pass_swipe_locked == locked) {
-        return;
-    }
-
-    pass_swipe_locked = locked;
-    lv_obj_set_scroll_dir(main_tv, locked ? LV_DIR_NONE : LV_DIR_HOR);
-    ESP_LOGI(TAG, "Pass tile swipe %s", locked ? "locked" : "unlocked");
-}
-
 static void disarm_wait_card_ui(void)
 {
     flow_wait_card_armed = false;
@@ -828,7 +849,7 @@ static bool arm_wait_card_ui(void)
     }
     if (sleep_command_sent || s_sleep_request_pending || s_wake_request_pending ||
         s_wake_sequence_active || !s_pm_lock_held) {
-        queue_power_request(POWER_WORKER_WAKE);
+        sys_worker_send_req(SYS_WORKER_WAKE);
         ESP_LOGI(TAG, "Insert Card ignored while STM32 wake confirmation is pending");
         return false;
     }
@@ -848,6 +869,106 @@ static bool arm_wait_card_ui(void)
     test_flow_set_wait_card_enabled(true);
     ESP_LOGI(TAG, "Wait-card armed by main flow tap");
     return true;
+}
+
+static bool diag_long_press_allowed(void)
+{
+    if (pass_tile && !lv_obj_has_flag(pass_tile, LV_OBJ_FLAG_HIDDEN)) {
+        return false;
+    }
+    return !s_in_diagnostic && current_flow_state == TEST_FLOW_WAIT_CARD;
+}
+
+static void set_diag_long_press_feedback(bool active)
+{
+    if (diag_long_press_feedback == active) {
+        return;
+    }
+
+    diag_long_press_feedback = active;
+    last_visual_state = (test_flow_state_t)-1;
+
+    if (active) {
+        lv_color_t accent = lv_color_hex(0xFF2EC4);
+        if (flow_ring_main) {
+            lv_obj_set_style_arc_color(flow_ring_main, accent, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_color(flow_ring_main, accent, LV_PART_MAIN);
+            lv_obj_set_style_arc_opa(flow_ring_main, LV_OPA_COVER, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_opa(flow_ring_main, LV_OPA_COVER, LV_PART_MAIN);
+        }
+        if (flow_halo) {
+            lv_obj_set_style_shadow_width(flow_halo, 22, 0);
+            lv_obj_set_style_shadow_color(flow_halo, accent, 0);
+            lv_obj_set_style_shadow_opa(flow_halo, LV_OPA_50, 0);
+        }
+        for (int i = 0; i < FLOW_GLINT_DOT_COUNT; i++) {
+            if (flow_glint_dots[i]) {
+                lv_obj_add_flag(flow_glint_dots[i], LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        if (flow_logo_label) {
+            lv_obj_set_style_text_color(flow_logo_label, accent, 0);
+            lv_obj_set_style_text_opa(flow_logo_label, LV_OPA_COVER, 0);
+        }
+        stop_flow_logo_sweep();
+        return;
+    }
+
+    if (flow_halo) {
+        lv_obj_set_style_shadow_width(flow_halo, 0, 0);
+        lv_obj_set_style_shadow_color(flow_halo, lv_color_hex(0x6375EC), 0);
+        lv_obj_set_style_shadow_opa(flow_halo, LV_OPA_TRANSP, 0);
+    }
+    if (!flow_stage_scroll_hidden && !flow_glint_paused) {
+        for (int i = 0; i < FLOW_GLINT_DOT_COUNT; i++) {
+            if (flow_glint_dots[i]) {
+                lv_obj_remove_flag(flow_glint_dots[i], LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+    }
+    update_flow_stage_visuals(current_flow_state);
+    update_flow_logo_effect(current_flow_state);
+}
+
+static void cancel_diag_long_press(void)
+{
+    diag_long_press_tracking = false;
+    set_diag_long_press_feedback(false);
+    if (diag_long_press_timer) {
+        lv_timer_pause(diag_long_press_timer);
+    }
+}
+
+static void diag_long_press_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    uint32_t now = lv_tick_get();
+
+    if (!diag_long_press_tracking ||
+        !diag_long_press_allowed() ||
+        !pass_tile ||
+        is_dimmed) {
+        cancel_diag_long_press();
+        return;
+    }
+
+    uint32_t elapsed = now - diag_long_press_start_ms;
+    if (elapsed >= DIAG_LONG_PRESS_FEEDBACK_MS) {
+        set_diag_long_press_feedback(true);
+    }
+
+    if (elapsed < DIAG_LONG_PRESS_MS) {
+        return;
+    }
+
+    cancel_diag_long_press();
+    stop_flow_logo_sweep();
+    set_flow_glint_paused(true);
+    set_flow_stage_scroll_hidden(true);
+    diag_long_press_fired = true;
+    lv_obj_remove_flag(pass_tile, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(pass_tile);
+    ESP_LOGI(TAG, "Diagnostic passcode page opened by long press");
 }
 
 static void set_flow_glint_paused(bool paused)
@@ -903,37 +1024,6 @@ static void set_flow_stage_scroll_hidden(bool hidden)
     }
 }
 
-static void flow_stage_restore_timer_cb(lv_timer_t *timer)
-{
-    (void)timer;
-    flow_stage_restore_timer = NULL;
-
-    if (main_tv && lv_tileview_get_tile_active(main_tv) == main_tile) {
-        set_flow_stage_scroll_hidden(false);
-        if (current_flow_state == TEST_FLOW_WAIT_CARD && !flow_wait_card_armed && !is_dimmed) {
-            if (flow_phase_label) {
-                lv_label_set_text(flow_phase_label, "Ready");
-            }
-            start_flow_logo_sweep();
-        }
-    }
-}
-
-static void cancel_flow_stage_restore(void)
-{
-    if (flow_stage_restore_timer) {
-        lv_timer_delete(flow_stage_restore_timer);
-        flow_stage_restore_timer = NULL;
-    }
-}
-
-static void schedule_flow_stage_restore(void)
-{
-    cancel_flow_stage_restore();
-    flow_stage_restore_timer = lv_timer_create(flow_stage_restore_timer_cb, 500, NULL);
-    lv_timer_set_repeat_count(flow_stage_restore_timer, 1);
-}
-
 static void flow_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -966,12 +1056,20 @@ static void flow_timer_cb(lv_timer_t *timer)
 
 static void pass_overlay_close(void)
 {
+    cancel_diag_long_press();
+    diag_long_press_fired = false;
+
     if (pass_code_label) {
         lv_label_set_text(pass_code_label, "");
     }
 
-    if (main_tv) {
-        lv_obj_set_tile_id(main_tv, 0, 0, LV_ANIM_ON);
+    if (pass_tile) {
+        lv_obj_add_flag(pass_tile, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (!s_in_diagnostic && main_page && !lv_obj_has_flag(main_page, LV_OBJ_FLAG_HIDDEN)) {
+        set_flow_stage_scroll_hidden(false);
+        update_flow_logo_effect(current_flow_state);
     }
 
 }
@@ -1471,10 +1569,31 @@ static void build_kino_stage(lv_obj_t *parent)
 
 static void update_flow_stage_visuals(test_flow_state_t state)
 {
-    lv_color_t color = is_dimmed ? lv_color_hex(0x5E6B78) : flow_state_color(state);
+    bool animating = (state == TEST_FLOW_CARD_DETECTED ||
+                      state == TEST_FLOW_PREP_HOMING ||
+                      state == TEST_FLOW_PREP_OPENING ||
+                      state == TEST_FLOW_CLOSING ||
+                      state == TEST_FLOW_READING_NFC ||
+                      state == TEST_FLOW_GETTING_CHIP ||
+                      state == TEST_FLOW_MOCK_TESTING ||
+                      state == TEST_FLOW_POSTING_BIOMARKERS ||
+                      state == TEST_FLOW_SUCCESS_EJECTING ||
+                      flow_logo_sweep_running);
+
+    if (animating) {
+        set_flow_glint_paused(true);
+    } else {
+        if (!is_dimmed && !s_in_diagnostic && !flow_stage_scroll_hidden) {
+            set_flow_glint_paused(false);
+        }
+    }
+
+    lv_color_t color = diag_long_press_feedback ? lv_color_hex(0xFF2EC4) :
+                       is_dimmed ? lv_color_hex(0x5E6B78) : flow_state_color(state);
     lv_opa_t logo_opa = flow_report_display_state(state) ? LV_OPA_20 :
                          (!is_dimmed && state != TEST_FLOW_WAIT_CARD) ? LV_OPA_50 : LV_OPA_COVER;
-    int speed = flow_retryable_error_state(state) ? 13 :
+    int speed = diag_long_press_feedback ? -10 :
+                flow_retryable_error_state(state) ? 13 :
                 flow_report_display_state(state) ? 3 :
                 state == TEST_FLOW_WAIT_CARD ? 2 : 7;
 
@@ -1482,11 +1601,7 @@ static void update_flow_stage_visuals(test_flow_state_t state)
         return;
     }
 
-    if (flow_glint_paused || flow_stage_scroll_hidden) {
-        return;
-    }
-
-    bool visual_changed = last_visual_state != state || last_visual_dimmed != is_dimmed;
+    bool visual_changed = diag_long_press_feedback || last_visual_state != state || last_visual_dimmed != is_dimmed;
     if (visual_changed) {
         lv_opa_t ring_opa = is_dimmed ? LV_OPA_40 : LV_OPA_80;
         lv_obj_set_style_arc_color(flow_ring_main, color, LV_PART_INDICATOR);
@@ -1560,6 +1675,13 @@ static void update_flow_stage_visuals(test_flow_state_t state)
     }
 
     int base_angle = (270 + flow_tick * speed * 2) % 360;
+    if (base_angle < 0) {
+        base_angle += 360;
+    }
+    if (diag_long_press_feedback) {
+        return;
+    }
+
     int mid = FLOW_GLINT_DOT_COUNT / 2;
     for (int i = 0; i < FLOW_GLINT_DOT_COUNT; i++) {
         int angle = (base_angle + (i - mid) * 3 + 360) % 360;
@@ -1674,23 +1796,22 @@ static void build_main_flow(lv_obj_t *scr)
     lv_obj_set_style_pad_all(main_page, 0, 0);
     lv_obj_clear_flag(main_page, LV_OBJ_FLAG_SCROLLABLE);
 
-    main_tv = lv_tileview_create(main_page);
-    lv_obj_set_size(main_tv, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_color(main_tv, lv_color_hex(0x0B1C2E), 0);
-    lv_obj_set_scrollbar_mode(main_tv, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_add_event_cb(main_tv, main_flow_press_cb, LV_EVENT_PRESSED, NULL);
-    lv_obj_add_event_cb(main_tv, main_tileview_event_cb, LV_EVENT_SCROLL_BEGIN, NULL);
-    lv_obj_add_event_cb(main_tv, main_tileview_event_cb, LV_EVENT_SCROLL_END, NULL);
-    lv_obj_add_event_cb(main_tv, main_tileview_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
-
-    main_tile = lv_tileview_add_tile(main_tv, 0, 0, LV_DIR_HOR);
+    main_tile = lv_obj_create(main_page);
+    lv_obj_set_size(main_tile, LV_PCT(100), LV_PCT(100));
     lv_obj_set_style_bg_color(main_tile, lv_color_hex(0x0B1C2E), 0);
+    lv_obj_set_style_border_width(main_tile, 0, 0);
+    lv_obj_set_style_pad_all(main_tile, 0, 0);
     lv_obj_clear_flag(main_tile, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(main_tile, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(main_tile, main_flow_press_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(main_tile, main_flow_press_cb, LV_EVENT_PRESSING, NULL);
+    lv_obj_add_event_cb(main_tile, main_flow_press_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(main_tile, main_flow_press_cb, LV_EVENT_PRESS_LOST, NULL);
     lv_obj_add_event_cb(main_tile, main_flow_click_cb, LV_EVENT_CLICKED, NULL);
 
-    pass_tile = lv_tileview_add_tile(main_tv, 1, 0, LV_DIR_HOR);
+    pass_tile = lv_obj_create(main_page);
+    lv_obj_set_size(pass_tile, LV_PCT(100), LV_PCT(100));
+    lv_obj_add_flag(pass_tile, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(pass_tile, main_flow_press_cb, LV_EVENT_PRESSED, NULL);
     build_pass_tile(pass_tile);
 
@@ -1729,54 +1850,56 @@ static void build_main_flow(lv_obj_t *scr)
     build_flow_report(main_tile);
 
     flow_timer = lv_timer_create(flow_timer_cb, FLOW_TIMER_PERIOD_MS, NULL);
-    set_pass_swipe_lock(true);
-    lv_obj_set_tile_id(main_tv, 0, 0, LV_ANIM_OFF);
 }
 
 static void main_flow_press_cb(lv_event_t *e)
 {
-    if (!is_dimmed) {
-        return;
-    }
-
-    restore_screen_now();
-    lv_event_stop_bubbling(e);
-    lv_event_stop_processing(e);
-}
-
-static void main_tileview_event_cb(lv_event_t *e)
-{
     lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_SCROLL_BEGIN) {
-        if (current_flow_state == TEST_FLOW_WAIT_CARD && flow_wait_card_armed) {
-            disarm_wait_card_ui();
-        }
-        if (flow_phase_label) {
-            lv_label_set_text(flow_phase_label, "");
-        }
-        stop_flow_logo_sweep();
-        cancel_flow_stage_restore();
-        set_flow_glint_paused(true);
-        set_flow_stage_scroll_hidden(true);
+
+    if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        cancel_diag_long_press();
         return;
     }
 
-    lv_obj_t *active_tile = lv_tileview_get_tile_active(main_tv);
-    bool main_active = active_tile == main_tile;
-    if (code == LV_EVENT_VALUE_CHANGED || code == LV_EVENT_SCROLL_END) {
-        if (main_active) {
-            schedule_flow_stage_restore();
-        } else {
-            cancel_flow_stage_restore();
-            set_flow_glint_paused(true);
-            set_flow_stage_scroll_hidden(true);
-        }
+    if (code != LV_EVENT_PRESSED) {
+        return;
     }
+
+    if (is_dimmed) {
+        restore_screen_now();
+        cancel_diag_long_press();
+        lv_event_stop_bubbling(e);
+        lv_event_stop_processing(e);
+        return;
+    }
+
+    if (!diag_long_press_allowed()) {
+        return;
+    }
+
+    diag_long_press_tracking = true;
+    diag_long_press_fired = false;
+    diag_long_press_start_ms = lv_tick_get();
+    if (!diag_long_press_timer) {
+        diag_long_press_timer = lv_timer_create(diag_long_press_timer_cb, DIAG_LONG_PRESS_TICK_MS, NULL);
+    }
+    lv_timer_set_period(diag_long_press_timer, DIAG_LONG_PRESS_TICK_MS);
+    lv_timer_resume(diag_long_press_timer);
+    lv_timer_reset(diag_long_press_timer);
 }
 
 static void main_flow_click_cb(lv_event_t *e)
 {
     (void)e;
+
+    if (diag_long_press_fired) {
+        diag_long_press_fired = false;
+        return;
+    }
+
+    if (diag_long_press_tracking) {
+        cancel_diag_long_press();
+    }
 
     if (current_flow_state == TEST_FLOW_WAIT_CARD && !flow_wait_card_armed) {
         if ((uint32_t)(lv_tick_get() - last_dim_restore_ms) < WAKE_ARM_GUARD_MS) {
@@ -1842,101 +1965,14 @@ static void diag_prepare_tile(lv_obj_t *tile)
     lv_obj_add_event_cb(tile, diag_pointer_event_cb, LV_EVENT_PRESS_LOST, NULL);
 }
 
-static void diag_loop_fx_set_x(void *obj, int32_t value)
-{
-    lv_obj_set_x((lv_obj_t *)obj, (lv_coord_t)value);
-}
-
-static void diag_loop_fx_set_opa(void *obj, int32_t value)
-{
-    lv_obj_set_style_bg_opa((lv_obj_t *)obj, (lv_opa_t)value, 0);
-}
-
-static void diag_loop_fx_hide_cb(void *obj, int32_t value)
-{
-    (void)value;
-    lv_obj_add_flag((lv_obj_t *)obj, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void build_diag_loop_fx_overlay(lv_obj_t *parent)
-{
-    diag_loop_fx_overlay = lv_obj_create(parent);
-    lv_obj_set_size(diag_loop_fx_overlay, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_opa(diag_loop_fx_overlay, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(diag_loop_fx_overlay, 0, 0);
-    lv_obj_set_style_pad_all(diag_loop_fx_overlay, 0, 0);
-    lv_obj_add_flag(diag_loop_fx_overlay, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(diag_loop_fx_overlay, LV_OBJ_FLAG_SCROLLABLE);
-
-    diag_loop_fx_bar = lv_obj_create(diag_loop_fx_overlay);
-    lv_obj_set_size(diag_loop_fx_bar, 88, LV_PCT(100));
-    lv_obj_set_y(diag_loop_fx_bar, 0);
-    lv_obj_set_style_radius(diag_loop_fx_bar, 0, 0);
-    lv_obj_set_style_bg_color(diag_loop_fx_bar, lv_color_hex(0x6EE7F9), 0);
-    lv_obj_set_style_bg_opa(diag_loop_fx_bar, LV_OPA_0, 0);
-    lv_obj_set_style_border_width(diag_loop_fx_bar, 0, 0);
-    lv_obj_set_style_shadow_width(diag_loop_fx_bar, 40, 0);
-    lv_obj_set_style_shadow_color(diag_loop_fx_bar, lv_color_hex(0x9BE7FF), 0);
-    lv_obj_set_style_shadow_opa(diag_loop_fx_bar, LV_OPA_50, 0);
-    lv_obj_clear_flag(diag_loop_fx_bar, LV_OBJ_FLAG_SCROLLABLE);
-}
-
-static void diag_loop_fx_play(bool from_left)
-{
-    if (!diag_loop_fx_overlay || !diag_loop_fx_bar) {
-        return;
-    }
-
-    lv_anim_del(diag_loop_fx_bar, diag_loop_fx_set_x);
-    lv_anim_del(diag_loop_fx_bar, diag_loop_fx_set_opa);
-    lv_anim_del(diag_loop_fx_overlay, diag_loop_fx_hide_cb);
-
-    const int screen_w = 466;
-    const int bar_w = 88;
-    const int start_x = from_left ? -bar_w : screen_w;
-    const int end_x = from_left ? screen_w : -bar_w;
-
-    lv_obj_set_x(diag_loop_fx_bar, start_x);
-    lv_obj_set_style_bg_opa(diag_loop_fx_bar, (lv_opa_t)110, 0);
-    lv_obj_remove_flag(diag_loop_fx_overlay, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(diag_loop_fx_overlay);
-
-    lv_anim_t anim_x;
-    lv_anim_init(&anim_x);
-    lv_anim_set_var(&anim_x, diag_loop_fx_bar);
-    lv_anim_set_values(&anim_x, start_x, end_x);
-    lv_anim_set_time(&anim_x, 220);
-    lv_anim_set_exec_cb(&anim_x, diag_loop_fx_set_x);
-    lv_anim_start(&anim_x);
-
-    lv_anim_t anim_opa;
-    lv_anim_init(&anim_opa);
-    lv_anim_set_var(&anim_opa, diag_loop_fx_bar);
-    lv_anim_set_values(&anim_opa, 110, LV_OPA_0);
-    lv_anim_set_time(&anim_opa, 220);
-    lv_anim_set_exec_cb(&anim_opa, diag_loop_fx_set_opa);
-    lv_anim_start(&anim_opa);
-
-    lv_anim_t anim_hide;
-    lv_anim_init(&anim_hide);
-    lv_anim_set_var(&anim_hide, diag_loop_fx_overlay);
-    lv_anim_set_values(&anim_hide, 0, 1);
-    lv_anim_set_time(&anim_hide, 1);
-    lv_anim_set_delay(&anim_hide, 230);
-    lv_anim_set_exec_cb(&anim_hide, diag_loop_fx_hide_cb);
-    lv_anim_start(&anim_hide);
-}
-
 static lv_obj_t *diag_normalize_active_tile(lv_obj_t *active_tile)
 {
     if (active_tile == t_wrap_l) {
-        diag_loop_fx_play(true);
         lv_obj_set_tile_id(tv, 6, 0, LV_ANIM_OFF);
         return t6;
     }
 
     if (active_tile == t_wrap_r) {
-        diag_loop_fx_play(false);
         lv_obj_set_tile_id(tv, 1, 0, LV_ANIM_OFF);
         return t1;
     }
@@ -2069,12 +2105,6 @@ static void build_diag_exit_overlay(lv_obj_t *parent)
     lv_obj_center(cancel_label);
 }
 
-static void diag_tileview_scroll_cb(lv_event_t *e)
-{
-    (void)e;
-    ui_wifi_prov_on_move();
-}
-
 static void build_diagnostic(lv_obj_t *scr)
 {
     diagnostic_page = lv_obj_create(scr);
@@ -2088,7 +2118,6 @@ static void build_diagnostic(lv_obj_t *scr)
     lv_obj_set_size(tv, LV_PCT(100), LV_PCT(100));
     lv_obj_set_scrollbar_mode(tv, LV_SCROLLBAR_MODE_OFF);
 
-    lv_obj_add_event_cb(tv, diag_tileview_scroll_cb, LV_EVENT_SCROLL_BEGIN, NULL);
     lv_obj_add_event_cb(tv, diag_tileview_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     t_wrap_l = lv_tileview_add_tile(tv, 0, 0, LV_DIR_HOR);
@@ -2096,7 +2125,7 @@ static void build_diagnostic(lv_obj_t *scr)
     lv_obj_clear_flag(t_wrap_l, LV_OBJ_FLAG_SCROLLABLE);
 
     t1 = lv_tileview_add_tile(tv, 1, 0, LV_DIR_HOR);
-    ui_standby_init(t1);
+    ui_sys_stats_init(t1);
     diag_prepare_tile(t1);
     diag_enable_event_bubble_recursive(t1);
 
@@ -2106,22 +2135,22 @@ static void build_diagnostic(lv_obj_t *scr)
     diag_enable_event_bubble_recursive(t2);
 
     t3 = lv_tileview_add_tile(tv, 3, 0, LV_DIR_HOR);
-    ui_misc_init(t3);
+    ui_wifi_prov_init(t3);
     diag_prepare_tile(t3);
     diag_enable_event_bubble_recursive(t3);
 
     t4 = lv_tileview_add_tile(tv, 4, 0, LV_DIR_HOR);
-    ui_sys_stats_init(t4);
+    ui_misc_init(t4);
     diag_prepare_tile(t4);
     diag_enable_event_bubble_recursive(t4);
 
     t5 = lv_tileview_add_tile(tv, 5, 0, LV_DIR_HOR);
-    ui_ble_init(t5);
+    ui_standby_init(t5);
     diag_prepare_tile(t5);
     diag_enable_event_bubble_recursive(t5);
 
     t6 = lv_tileview_add_tile(tv, 6, 0, LV_DIR_HOR);
-    ui_wifi_prov_init(t6);
+    ui_ble_init(t6);
     diag_prepare_tile(t6);
     diag_enable_event_bubble_recursive(t6);
 
@@ -2133,10 +2162,8 @@ static void build_diagnostic(lv_obj_t *scr)
     lv_obj_add_event_cb(tv, diag_pointer_event_cb, LV_EVENT_PRESSING, NULL);
     lv_obj_add_event_cb(tv, diag_pointer_event_cb, LV_EVENT_RELEASED, NULL);
     lv_obj_add_event_cb(tv, diag_pointer_event_cb, LV_EVENT_PRESS_LOST, NULL);
-    lv_obj_add_event_cb(tv, diag_tileview_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     build_diag_exit_overlay(diagnostic_page);
-    build_diag_loop_fx_overlay(diagnostic_page);
 
     lv_obj_set_tile_id(tv, 1, 0, LV_ANIM_OFF);
     update_active_page(NULL);
@@ -2144,14 +2171,14 @@ static void build_diagnostic(lv_obj_t *scr)
 
 static void update_active_page(lv_obj_t *active_tile)
 {
-    set_auto_dim(active_tile != t5);
-    ui_standby_set_active(active_tile == t1);
+    set_auto_dim(active_tile != t6);
+    ui_sys_stats_set_active(active_tile == t1);
     ui_motor_set_active(active_tile == t2);
-    ui_misc_set_active(active_tile == t3);
+    ui_wifi_prov_set_active(active_tile == t3);
+    ui_misc_set_active(active_tile == t4);
+    ui_standby_set_active(active_tile == t5);
+    ui_ble_set_active(active_tile == t6);
     ui_nfc_set_active(active_tile == t2);
-    ui_sys_stats_set_active(active_tile == t4);
-    ui_ble_set_active(active_tile == t5);
-    ui_wifi_prov_set_active(active_tile == t6);
 }
 
 static void show_main_flow(void)
@@ -2160,9 +2187,9 @@ static void show_main_flow(void)
     s_in_diagnostic = false;
     flow_wait_card_armed = false;
     disarm_wait_card_ui();
-    cancel_flow_stage_restore();
     set_flow_stage_scroll_hidden(false);
     update_active_page(NULL);
+    ui_wifi_prov_force_stop_now();
     lv_obj_add_flag(diagnostic_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(main_page, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(main_page);
@@ -2178,7 +2205,6 @@ static void show_diagnostic(void)
     s_in_diagnostic = true;
     flow_wait_card_armed = false;
     disarm_wait_card_ui();
-    cancel_flow_stage_restore();
     set_flow_stage_scroll_hidden(true);
     flow_set_active(false);
     lv_obj_add_flag(main_page, LV_OBJ_FLAG_HIDDEN);
@@ -2214,20 +2240,20 @@ void ui_init(void)
         ESP_LOGI(TAG, "GPIO wakeup enabled on TOUCH_INT (GPIO %d)", BSP_LCD_TOUCH_INT);
     }
 
-    if (!s_power_worker_queue) {
-        s_power_worker_queue = xQueueCreate(4, sizeof(power_worker_req_t));
-        if (!s_power_worker_queue) {
-            ESP_LOGE(TAG, "power worker queue create failed");
+    if (!s_sys_worker_queue) {
+        s_sys_worker_queue = xQueueCreate(8, sizeof(sys_worker_req_t));
+        if (!s_sys_worker_queue) {
+            ESP_LOGE(TAG, "sys worker queue create failed");
         } else {
 #if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
-            BaseType_t ok = xTaskCreatePinnedToCore(power_worker_task, "power_worker", 4096, NULL, 5, NULL, APP_WORKER_TASK_CORE);
+            BaseType_t ok = xTaskCreatePinnedToCore(sys_worker_task, "sys_worker", 8192, NULL, 5, NULL, APP_WORKER_TASK_CORE);
 #else
-            BaseType_t ok = xTaskCreate(power_worker_task, "power_worker", 4096, NULL, 5, NULL);
+            BaseType_t ok = xTaskCreate(sys_worker_task, "sys_worker", 8192, NULL, 5, NULL);
 #endif
             if (ok != pdPASS) {
-                ESP_LOGE(TAG, "power worker task create failed");
-                vQueueDelete(s_power_worker_queue);
-                s_power_worker_queue = NULL;
+                ESP_LOGE(TAG, "sys worker task create failed");
+                vQueueDelete(s_sys_worker_queue);
+                s_sys_worker_queue = NULL;
             }
         }
     }
@@ -2254,9 +2280,5 @@ void ui_init(void)
 
     lv_timer_create(inactivity_timer_cb, 500, NULL);
     show_main_flow();
-#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
-    xTaskCreatePinnedToCore(wifi_auto_connect_task, "wifi_auto", 4096, NULL, 5, NULL, APP_WORKER_TASK_CORE);
-#else
-    xTaskCreate(wifi_auto_connect_task, "wifi_auto", 4096, NULL, 5, NULL);
-#endif
+    sys_worker_send_req(SYS_WORKER_WIFI_AUTO_CONNECT);
 }

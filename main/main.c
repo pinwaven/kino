@@ -20,17 +20,56 @@
 
 static const char *TAG = "APP_MAIN";
 
+static const char *reset_reason_to_str(esp_reset_reason_t reason)
+{
+    switch (reason) {
+    case ESP_RST_POWERON:
+        return "POWERON";
+    case ESP_RST_EXT:
+        return "EXT";
+    case ESP_RST_SW:
+        return "SW";
+    case ESP_RST_PANIC:
+        return "PANIC";
+    case ESP_RST_INT_WDT:
+        return "INT_WDT";
+    case ESP_RST_TASK_WDT:
+        return "TASK_WDT";
+    case ESP_RST_WDT:
+        return "WDT";
+    case ESP_RST_DEEPSLEEP:
+        return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT:
+        return "BROWNOUT";
+    case ESP_RST_SDIO:
+        return "SDIO";
+#if ESP_IDF_VERSION_MAJOR >= 5
+    case ESP_RST_USB:
+        return "USB";
+    case ESP_RST_JTAG:
+        return "JTAG";
+    case ESP_RST_EFUSE:
+        return "EFUSE";
+    case ESP_RST_PWR_GLITCH:
+        return "PWR_GLITCH";
+#endif
+    default:
+        return "UNKNOWN";
+    }
+}
+
 static void log_boot_info(void)
 {
     esp_chip_info_t chip_info;
     uint32_t flash_size = 0;
+    esp_reset_reason_t reset_reason = esp_reset_reason();
 
     esp_chip_info(&chip_info);
     esp_flash_get_size(NULL, &flash_size);
 
     ESP_LOGI(TAG,
-             "boot reset=%d cores=%d rev=%d flash=%luMB internal=%u dma=%u psram=%u",
-             (int)esp_reset_reason(),
+             "boot reset=%s cores=%d rev=%d flash=%luMB internal=%u dma=%u psram=%u",
+             reset_reason_to_str(reset_reason),
              chip_info.cores,
              chip_info.revision,
              (unsigned long)(flash_size / (1024 * 1024)),

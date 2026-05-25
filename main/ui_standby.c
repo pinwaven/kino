@@ -1,6 +1,8 @@
 #include "ui_app.h"
 #include "stm32_interface.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <stdio.h>
 
 static lv_obj_t *main_val_label;
@@ -18,6 +20,18 @@ static lv_obj_t *psys_sw;
 static lv_obj_t *psys_label;
 
 static int rotate_idx = 0;
+static volatile bool s_bms_poll_pending = false;
+static volatile esp_err_t bms_last_err = ESP_ERR_INVALID_STATE;
+
+void ui_standby_clear_bms_pending(void)
+{
+    s_bms_poll_pending = false;
+}
+
+void ui_standby_set_bms_err(esp_err_t err)
+{
+    bms_last_err = err;
+}
 
 static int battery_percent_from_mv(int vbatt_mv) {
     const int empty_mv = 6400;
@@ -42,7 +56,16 @@ static void psys_sw_event_cb(lv_event_t * e) {
 }
 
 static void update_timer_cb(lv_timer_t *timer) {
-    esp_err_t err = stm32_update_bmsinfo();
+    (void)timer;
+
+    if (!s_bms_poll_pending) {
+        s_bms_poll_pending = true;
+        if (!sys_worker_send_req(SYS_WORKER_BMS_POLL)) {
+            s_bms_poll_pending = false;
+        }
+    }
+
+    esp_err_t err = bms_last_err;
     stm32_state_t state;
 
     if (err != ESP_OK) {
@@ -138,6 +161,10 @@ void ui_standby_set_active(bool active) {
     if (!update_timer) return;
 
     if (active) {
+        s_bms_poll_pending = true;
+        if (!sys_worker_send_req(SYS_WORKER_BMS_POLL)) {
+            s_bms_poll_pending = false;
+        }
         lv_timer_resume(update_timer);
         lv_timer_ready(update_timer);
     } else {

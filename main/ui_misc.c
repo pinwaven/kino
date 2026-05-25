@@ -3,6 +3,7 @@
 #include "test_flow.h"
 #include "esp_log.h"
 #include "nvs.h"
+#include "src/misc/lv_timer_private.h"
 #include <string.h>
 
 static lv_obj_t *mock_sw;
@@ -10,6 +11,47 @@ static lv_obj_t *fps_sw;
 static lv_obj_t *sleep_sw;
 static bool fps_show = true;
 static bool s_deep_sleep_enabled = true;
+static lv_obj_t *fps_label;
+static lv_timer_t *fps_timer;
+
+static void fps_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (fps_label) {
+        lv_timer_t *refr = lv_display_get_refr_timer(NULL);
+        uint32_t period = refr ? refr->period : LV_DEF_REFR_PERIOD;
+        uint32_t fps = period > 0 ? (1000U + period / 2U) / period : 0;
+        lv_label_set_text_fmt(fps_label, "%u", (unsigned)fps);
+    }
+}
+
+static void ensure_fps_overlay(void)
+{
+    lv_display_t *disp = lv_display_get_default();
+    if (disp) {
+#if LV_USE_PERF_MONITOR
+        lv_sysmon_hide_performance(disp);
+#endif
+    }
+
+    if (!fps_label) {
+        fps_label = lv_label_create(lv_layer_top());
+        lv_obj_set_style_text_font(fps_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(fps_label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_bg_color(fps_label, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(fps_label, LV_OPA_60, 0);
+        lv_obj_set_style_pad_hor(fps_label, 6, 0);
+        lv_obj_set_style_pad_ver(fps_label, 2, 0);
+        lv_obj_set_style_radius(fps_label, 4, 0);
+        lv_obj_align(fps_label, LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_obj_add_flag(fps_label, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (!fps_timer) {
+        fps_timer = lv_timer_create(fps_timer_cb, 1000, NULL);
+        lv_timer_pause(fps_timer);
+    }
+}
 
 bool ui_misc_is_deep_sleep_enabled(void)
 {
@@ -18,13 +60,16 @@ bool ui_misc_is_deep_sleep_enabled(void)
 
 static void apply_fps_show_setting(void)
 {
-#if LV_USE_PERF_MONITOR
+    ensure_fps_overlay();
     if (fps_show) {
-        lv_sysmon_show_performance(NULL);
+        lv_label_set_text(fps_label, "--");
+        lv_obj_remove_flag(fps_label, LV_OBJ_FLAG_HIDDEN);
+        lv_timer_resume(fps_timer);
+        lv_timer_ready(fps_timer);
     } else {
-        lv_sysmon_hide_performance(NULL);
+        lv_timer_pause(fps_timer);
+        lv_obj_add_flag(fps_label, LV_OBJ_FLAG_HIDDEN);
     }
-#endif
 }
 
 static void load_fps_show_setting(void)
@@ -252,9 +297,6 @@ void ui_misc_init(lv_obj_t *tile) {
     fps_sw = create_switch_row(btn_cont, "FPS Show");
     lv_obj_add_event_cb(fps_sw, fps_sw_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
     sync_fps_switch_from_flash();
-#if !LV_USE_PERF_MONITOR
-    lv_obj_add_state(fps_sw, LV_STATE_DISABLED);
-#endif
 
     sleep_sw = create_switch_row(btn_cont, "Deep Sleep");
     lv_obj_add_event_cb(sleep_sw, sleep_sw_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
