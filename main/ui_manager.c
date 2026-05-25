@@ -222,11 +222,12 @@ static void power_worker_task(void *arg)
                 ESP_LOGI(TAG, "Stopping Wi-Fi radio for deep sleep");
                 esp_wifi_stop();
 
-                if (s_light_sleep_lock && s_pm_lock_held) {
-                    esp_pm_lock_release(s_light_sleep_lock);
-                    s_pm_lock_held = false;
-                    ESP_LOGI(TAG, "Released PM lock, allowing ESP32 Light Sleep");
-                }
+                /*
+                 * Keep ESP32 light sleep locked while the display is dimmed.
+                 * Releasing it here can let the CPU go back to sleep between the
+                 * touch wake event and the UI/worker wake path, which can leave
+                 * the AMOLED black with no task-WDT panic.
+                 */
             } else {
                 ESP_LOGE(TAG, "Failed to send sleep command to STM32: %s", esp_err_to_name(err));
             }
@@ -348,6 +349,12 @@ static void flow_resume_render(void)
 static void restore_screen_now(void)
 {
     bool was_dimmed = is_dimmed;
+
+    if (s_light_sleep_lock && !s_pm_lock_held) {
+        esp_pm_lock_acquire(s_light_sleep_lock);
+        s_pm_lock_held = true;
+        ESP_LOGI(TAG, "Acquired PM lock before display restore");
+    }
 
     bsp_display_brightness_set(BRIGHTNESS_NORMAL);
     if (!flow_render_paused) {
