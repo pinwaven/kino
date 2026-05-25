@@ -1,11 +1,15 @@
 #include "ui_app.h"
 #include "esp_log.h"
 #include "bsp/display.h"
+#include "bsp/esp-bsp.h"
 #include "wifi_prov.h"
 #include "test_flow.h"
 #include "stm32_interface.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_pm.h"
+#include "esp_sleep.h"
+#include "driver/gpio.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -118,6 +122,8 @@ static test_flow_state_t last_flow_state = TEST_FLOW_PREP_HOMING;
 static test_flow_state_t current_flow_state = TEST_FLOW_PREP_HOMING;
 static uint32_t dimmed_start_time_ms = 0;
 static bool sleep_command_sent = false;
+static esp_pm_lock_handle_t s_light_sleep_lock = NULL;
+static bool s_pm_lock_held = true;
 
 static void update_active_page(lv_obj_t *active_tile);
 static void show_main_flow(void);
@@ -194,6 +200,11 @@ static void restore_screen_now(void)
     }
     if (was_dimmed) {
         last_dim_restore_ms = lv_tick_get();
+        if (s_light_sleep_lock && !s_pm_lock_held) {
+            esp_pm_lock_acquire(s_light_sleep_lock);
+            s_pm_lock_held = true;
+            ESP_LOGI(TAG, "Acquired PM lock, preventing ESP32 Light Sleep");
+        }
         if (sleep_command_sent) {
             sleep_command_sent = false;
             ESP_LOGI(TAG, "Waking up STM32 after sleep...");
@@ -426,6 +437,11 @@ static void inactivity_timer_cb(lv_timer_t *t)
                 if (err == ESP_OK) {
                     sleep_command_sent = true;
                     ESP_LOGI(TAG, "Sleep command sent to STM32 successfully.");
+                    if (s_light_sleep_lock && s_pm_lock_held) {
+                        esp_pm_lock_release(s_light_sleep_lock);
+                        s_pm_lock_held = false;
+                        ESP_LOGI(TAG, "Released PM lock, allowing ESP32 Light Sleep");
+                    }
                 } else {
                     ESP_LOGE(TAG, "Failed to send sleep command to STM32: %s", esp_err_to_name(err));
                 }
@@ -2033,6 +2049,18 @@ void ui_init(void)
     last_flow_state = TEST_FLOW_PREP_HOMING;
     current_flow_state = TEST_FLOW_PREP_HOMING;
     keep_awake_until_ms = 0;
+
+    if (!s_light_sleep_lock) {
+        esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "no_sleep", &s_light_sleep_lock);
+        // 初始持有锁，阻止运行期间进入休眠
+        esp_pm_lock_acquire(s_light_sleep_lock);
+        ESP_LOGI(TAG, "PM light sleep lock created and acquired");
+
+        // 配置触摸屏中断引脚唤醒
+        esp_sleep_enable_gpio_wakeup();
+        gpio_wakeup_enable(BSP_LCD_TOUCH_INT, GPIO_INTR_LOW_LEVEL);
+        ESP_LOGI(TAG, "GPIO wakeup enabled on TOUCH_INT (GPIO %d)", BSP_LCD_TOUCH_INT);
+    }
 
     overlay = lv_obj_create(lv_layer_top());
     lv_obj_set_size(overlay, LV_PCT(100), LV_PCT(100));
