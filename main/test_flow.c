@@ -1,6 +1,7 @@
 #include "test_flow.h"
 #include "nano_api.h"
 #include "stm32_interface.h"
+#include "wifi_prov.h"
 #include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -550,6 +551,14 @@ static void test_flow_step_locked(void)
     s_flow.cd_value = cd;
 
     if (inserted) {
+        wifi_prov_status_t wifi_status;
+        wifi_prov_get_status(&wifi_status);
+        bool is_connected = (wifi_status.state == WIFI_PROV_STATE_CONNECTED) || (wifi_status.got_ip[0] != '\0');
+        if (!is_connected) {
+            s_consecutive_card_count = 0;
+            set_state_locked(TEST_FLOW_WAIT_CARD);
+            return;
+        }
         s_consecutive_card_count++;
         if (s_consecutive_card_count >= CARD_INSERT_STABLE_POLLS) {
             set_state_locked(TEST_FLOW_CLOSING);
@@ -715,8 +724,15 @@ const char *test_flow_status_text(test_flow_state_t state)
     case TEST_FLOW_RECOVERY_OPENING:
         return "Ejecting card";
     case TEST_FLOW_WAIT_CARD:
-    default:
+    default: {
+        wifi_prov_status_t status;
+        wifi_prov_get_status(&status);
+        bool is_connected = (status.state == WIFI_PROV_STATE_CONNECTED) || (status.got_ip[0] != '\0');
+        if (!is_connected) {
+            return "WiFi Disconnected";
+        }
         return "Insert Card";
+    }
     }
 }
 
@@ -725,6 +741,15 @@ const char *test_flow_hint_text(const test_flow_snapshot_t *snapshot)
     if (!snapshot) return "";
 
     bool mock = s_motor_mock;
+
+    if (snapshot->state == TEST_FLOW_WAIT_CARD) {
+        wifi_prov_status_t status;
+        wifi_prov_get_status(&status);
+        bool is_connected = (status.state == WIFI_PROV_STATE_CONNECTED) || (status.got_ip[0] != '\0');
+        if (!is_connected) {
+            return "Please connect to WiFi first";
+        }
+    }
 
     if (snapshot->state == TEST_FLOW_PREP_HOMING) {
         return mock ? "Homing tray (mock 2.5s)" : "Homing tray (Hardware)";

@@ -16,6 +16,7 @@
 #include "stm32_interface.h"
 #include "ui_app.h"
 #include "nano_api.h"
+#include "driver/gpio.h"
 
 static const char *TAG = "APP_MAIN";
 
@@ -182,6 +183,17 @@ static void show_boot_animation(void)
 
 void app_main(void)
 {
+    // 强制关闭板载音频功放以节省 10-30mA 静态功耗
+    gpio_config_t amp_conf = {
+        .pin_bit_mask = (1ULL << GPIO_NUM_46),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&amp_conf);
+    gpio_set_level(GPIO_NUM_46, 0);
+
     init_cjson_psram_hooks();
     log_boot_info();
     init_nvs_tolerant();

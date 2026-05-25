@@ -9,6 +9,7 @@
 #include "freertos/task.h"
 #include "esp_pm.h"
 #include "esp_sleep.h"
+#include "esp_wifi.h"
 #include "driver/gpio.h"
 #include <stdio.h>
 #include <string.h>
@@ -99,6 +100,7 @@ static bool flow_stage_scroll_hidden = false;
 
 static bool is_dimmed = false;
 static bool allow_auto_dim = true;
+static bool s_in_diagnostic = false;
 static uint32_t last_dim_restore_ms;
 static const int BRIGHTNESS_NORMAL = 66;
 static const int BRIGHTNESS_DIMMED = 20;
@@ -108,7 +110,7 @@ static const uint32_t INSERT_CARD_TIMEOUT_MS = 30000;
 static const uint32_t ERROR_INACTIVITY_TIMEOUT_MS = 30000;
 static const uint32_t CARD_AWAKE_HOLD_MS = 60000;
 static const uint32_t REFR_PERIOD_NORMAL = 16;
-static const uint32_t REFR_PERIOD_DIMMED = 200;
+static const uint32_t REFR_PERIOD_DIMMED = 1000;
 static const uint32_t REFR_PERIOD_AFTER_NETWORK = 80;
 static const uint32_t FLOW_TIMER_PERIOD_MS = 80;
 static const int FLOW_GLINT_DOT_COUNT = 7;
@@ -200,18 +202,33 @@ static void restore_screen_now(void)
     }
     if (was_dimmed) {
         last_dim_restore_ms = lv_tick_get();
+        if (overlay_logo_label) {
+            lv_obj_set_style_text_color(overlay_logo_label, lv_color_hex(0x536170), 0);
+            lv_obj_set_style_text_opa(overlay_logo_label, LV_OPA_70, 0);
+            lv_obj_align(overlay_logo_label, LV_ALIGN_CENTER, 3, -18);
+        }
         if (s_light_sleep_lock && !s_pm_lock_held) {
             esp_pm_lock_acquire(s_light_sleep_lock);
             s_pm_lock_held = true;
             ESP_LOGI(TAG, "Acquired PM lock, preventing ESP32 Light Sleep");
+            
+            // 重新拉起 Wi-Fi 射频以进行网络通信
+            ESP_LOGI(TAG, "Starting Wi-Fi radio on wakeup...");
+            esp_err_t start_err = esp_wifi_start();
+            if (start_err == ESP_OK) {
+                ESP_LOGI(TAG, "Triggering Wi-Fi reconnection...");
+                esp_wifi_connect();
+            } else {
+                ESP_LOGE(TAG, "Failed to start Wi-Fi radio: %s", esp_err_to_name(start_err));
+            }
         }
         if (sleep_command_sent) {
             sleep_command_sent = false;
             ESP_LOGI(TAG, "Waking up STM32 after sleep...");
             bool success = false;
             char resp_buf[64];
-            for (int retry = 0; retry < 3; retry++) {
-                ESP_LOGI(TAG, "Sending CMD_HI to wake up (attempt %d/3)", retry + 1);
+            for (int retry = 0; retry < 5; retry++) {
+                ESP_LOGI(TAG, "Sending CMD_HI to wake up (attempt %d/5)", retry + 1);
                 esp_err_t err = stm32_cmd_request_timeout(CMD_HI, NULL, 0, resp_buf, sizeof(resp_buf), 150);
                 if (err == ESP_OK && strncmp(resp_buf, "ver:", 4) == 0) {
                     success = true;
@@ -221,7 +238,7 @@ static void restore_screen_now(void)
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
             if (!success) {
-                ESP_LOGE(TAG, "Failed to wake up STM32 after 3 attempts!");
+                ESP_LOGE(TAG, "Failed to wake up STM32 after 5 attempts!");
                 test_flow_trigger_external_error(TEST_FLOW_CARD_DETECT_ERROR, "awake mcu failed\nreboot please..");
             }
         }
@@ -429,14 +446,43 @@ static void inactivity_timer_cb(lv_timer_t *t)
     uint32_t inactive_time = lv_display_get_inactive_time(NULL);
 
     if (is_dimmed) {
-        if (current_flow_state == TEST_FLOW_WAIT_CARD && !sleep_command_sent) {
+        // OLED Screensaver: 微调 Logo 位置以防止烧屏
+        static int position_tick = 0;
+        if (overlay_logo_label) {
+            position_tick++;
+            if (position_tick >= 3) { // 每 3 秒（3次 Tick）漂移换位一次
+                position_tick = 0;
+                static int offset_idx = 0;
+                const int offsets_x[] = {3, 15, -10, 8, -12, 10, -5, 12};
+                const int offsets_y[] = {-18, -8, -25, -12, -22, -10, -28, -15};
+                int ox = offsets_x[offset_idx];
+                int oy = offsets_y[offset_idx];
+                offset_idx = (offset_idx + 1) % 8;
+                
+                lv_obj_align(overlay_logo_label, LV_ALIGN_CENTER, ox, oy);
+            }
+        }
+
+        bool deep_sleep_enabled = ui_misc_is_deep_sleep_enabled();
+        if (current_flow_state == TEST_FLOW_WAIT_CARD && !s_in_diagnostic && deep_sleep_enabled && !sleep_command_sent) {
             uint32_t dimmed_duration = lv_tick_get() - dimmed_start_time_ms;
-            if (dimmed_duration >= 120000) { // 2 minutes (120,000 ms)
-                ESP_LOGI(TAG, "Screen dimmed for >2 minutes. Sending sleep command to STM32.");
+            if (dimmed_duration >= 50000) { // 50 seconds (50,000 ms)
+                ESP_LOGI(TAG, "Screen dimmed for >50 seconds. Sending sleep command to STM32.");
                 esp_err_t err = stm32_cmd_send_action(CMD_SLEEP, NULL, 0);
                 if (err == ESP_OK) {
                     sleep_command_sent = true;
                     ESP_LOGI(TAG, "Sleep command sent to STM32 successfully.");
+                    
+                    // 将 Logo 亮度提升约 10%
+                    if (overlay_logo_label) {
+                        lv_obj_set_style_text_color(overlay_logo_label, lv_color_hex(0x647385), 0);
+                        lv_obj_set_style_text_opa(overlay_logo_label, LV_OPA_80, 0);
+                    }
+                    
+                    // 彻底关闭 Wi-Fi 射频以节省 80-120mA 功耗
+                    ESP_LOGI(TAG, "Stopping Wi-Fi radio for deep sleep...");
+                    esp_wifi_stop();
+                    
                     if (s_light_sleep_lock && s_pm_lock_held) {
                         esp_pm_lock_release(s_light_sleep_lock);
                         s_pm_lock_held = false;
@@ -499,6 +545,9 @@ static void inactivity_timer_cb(lv_timer_t *t)
         bsp_display_brightness_set(BRIGHTNESS_DIMMED);
         if (!flow_render_paused) {
             lv_timer_set_period(lv_display_get_refr_timer(NULL), REFR_PERIOD_DIMMED);
+        }
+        if (flow_timer) {
+            lv_timer_set_period(flow_timer, REFR_PERIOD_DIMMED);
         }
         is_dimmed = true;
         dimmed_start_time_ms = lv_tick_get();
@@ -2007,6 +2056,7 @@ static void update_active_page(lv_obj_t *active_tile)
 static void show_main_flow(void)
 {
     ESP_LOGI(TAG, "show main flow");
+    s_in_diagnostic = false;
     flow_wait_card_armed = false;
     disarm_wait_card_ui();
     cancel_flow_stage_restore();
@@ -2024,6 +2074,7 @@ static void show_main_flow(void)
 static void show_diagnostic(void)
 {
     ESP_LOGI(TAG, "show diagnostic");
+    s_in_diagnostic = true;
     flow_wait_card_armed = false;
     disarm_wait_card_ui();
     cancel_flow_stage_restore();
