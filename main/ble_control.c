@@ -31,6 +31,7 @@
 #define MOTOR_ACTION_DRAIN_MS 180
 #define BLE_MIN_DMA_HEAP_BEFORE_START 16384
 #define BLE_WDT_TIMEOUT_TICKS pdMS_TO_TICKS(4000)
+#define APP_WORKER_TASK_CORE 1
 
 static const char *TAG = "BLE_CONTROL";
 #if BLE_CONTROL_STACK_AVAILABLE
@@ -661,7 +662,12 @@ static esp_err_t ble_control_init_once(void) {
         return ESP_FAIL;
     }
 
-    BaseType_t task_ok = xTaskCreate(cmd_worker_task, "ble_cmd_worker", 4096, NULL, 5, NULL);
+    BaseType_t task_ok;
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+    task_ok = xTaskCreatePinnedToCore(cmd_worker_task, "ble_cmd_worker", 4096, NULL, 5, NULL, APP_WORKER_TASK_CORE);
+#else
+    task_ok = xTaskCreate(cmd_worker_task, "ble_cmd_worker", 4096, NULL, 5, NULL);
+#endif
     if (task_ok != pdPASS) {
         xSemaphoreGive(g_init_mutex);
         return ESP_ERR_NO_MEM;

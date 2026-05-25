@@ -117,6 +117,7 @@ static const int FLOW_GLINT_DOT_COUNT = 7;
 static const int FLOW_GLINT_RADIUS = 213;
 static const int LOGO_SWEEP_STEPS = 8;
 static const int LOGO_SWEEP_TRAVERSALS = 6;
+static const BaseType_t APP_WORKER_TASK_CORE = 1;
 static uint32_t network_recover_until_ms;
 static uint32_t keep_awake_until_ms;
 static uint32_t insert_card_wait_until_ms;
@@ -2135,5 +2136,9 @@ void ui_init(void)
 
     lv_timer_create(inactivity_timer_cb, 500, NULL);
     show_main_flow();
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+    xTaskCreatePinnedToCore(wifi_auto_connect_task, "wifi_auto", 4096, NULL, 5, NULL, APP_WORKER_TASK_CORE);
+#else
     xTaskCreate(wifi_auto_connect_task, "wifi_auto", 4096, NULL, 5, NULL);
+#endif
 }

@@ -24,6 +24,7 @@
 #define WAIT_CARD_POLL_SETTLE_MS 500
 #define CARD_DETECT_MAX_FAILS 3
 #define CARD_INSERT_STABLE_POLLS 5
+#define APP_WORKER_TASK_CORE 1
 
 static const char *TAG = "TEST_FLOW";
 
@@ -405,12 +406,18 @@ static void test_flow_step_locked(void)
     }
 
     if (s_flow.state == TEST_FLOW_READING_NFC) {
+        char nfc_code[sizeof(s_flow.nfc_code)] = {0};
+        esp_err_t read_err;
         unlock_flow();
-        s_flow.last_error = stm32_read_nfc_first_record(s_flow.nfc_code, sizeof(s_flow.nfc_code));
+        read_err = stm32_read_nfc_first_record(nfc_code, sizeof(nfc_code));
         lock_flow();
-        if (s_flow.last_error == ESP_OK) {
+        s_flow.last_error = read_err;
+        if (read_err == ESP_OK) {
+            strncpy(s_flow.nfc_code, nfc_code, sizeof(s_flow.nfc_code) - 1);
+            s_flow.nfc_code[sizeof(s_flow.nfc_code) - 1] = '\0';
             set_state_locked(TEST_FLOW_NFC_READY);
         } else {
+            s_flow.nfc_code[0] = '\0';
             set_state_locked(TEST_FLOW_NFC_ERROR);
         }
         return;
@@ -429,15 +436,21 @@ static void test_flow_step_locked(void)
     }
 
     if (s_flow.state == TEST_FLOW_GETTING_CHIP) {
+        char nfc_code[sizeof(s_flow.nfc_code)];
+        esp_err_t verify_err;
+
         log_stack_watermark("before verify");
+        strncpy(nfc_code, s_flow.nfc_code, sizeof(nfc_code) - 1);
+        nfc_code[sizeof(nfc_code) - 1] = '\0';
         wdt_detach_self();
         unlock_flow();
-        s_flow.last_error = nano_api_get_chip(s_flow.nfc_code);
+        verify_err = nano_api_get_chip(nfc_code);
         lock_flow();
         wdt_restore_self();
         log_stack_watermark("after verify");
+        s_flow.last_error = verify_err;
         set_last_error_message_locked(nano_api_last_error_message());
-        set_state_locked(s_flow.last_error == ESP_OK ? TEST_FLOW_MOCK_TESTING : TEST_FLOW_API_ERROR);
+        set_state_locked(verify_err == ESP_OK ? TEST_FLOW_MOCK_TESTING : TEST_FLOW_API_ERROR);
         return;
     }
 
@@ -449,11 +462,13 @@ static void test_flow_step_locked(void)
     }
 
     if (s_flow.state == TEST_FLOW_POSTING_BIOMARKERS) {
+        esp_err_t upload_err;
+
         log_stack_watermark("before upload");
         wdt_detach_self();
         unlock_flow();
-        s_flow.last_error = nano_api_post_mock_biomarkers();
-        if (s_flow.last_error == ESP_OK) {
+        upload_err = nano_api_post_mock_biomarkers();
+        if (upload_err == ESP_OK) {
             esp_err_t final_err = nano_api_post_kino_result();
             if (final_err != ESP_OK) {
                 ESP_LOGW(TAG, "Nano kino-result finalisation failed but mock flow is complete: %s", nano_api_last_error_message());
@@ -462,9 +477,10 @@ static void test_flow_step_locked(void)
         lock_flow();
         wdt_restore_self();
         log_stack_watermark("after upload");
+        s_flow.last_error = upload_err;
         set_last_error_message_locked(nano_api_last_error_message());
         set_upload_summary_locked(nano_api_last_upload_summary());
-        set_state_locked(s_flow.last_error == ESP_OK ? TEST_FLOW_UPLOAD_REVIEW : TEST_FLOW_API_ERROR);
+        set_state_locked(upload_err == ESP_OK ? TEST_FLOW_UPLOAD_REVIEW : TEST_FLOW_API_ERROR);
         return;
     }
 
@@ -615,7 +631,11 @@ void test_flow_start(void)
 {
     if (s_task_started) return;
     s_task_started = true;
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+    xTaskCreatePinnedToCore(test_flow_task, "test_flow", FLOW_TASK_STACK_BYTES, NULL, 5, &s_task, APP_WORKER_TASK_CORE);
+#else
     xTaskCreate(test_flow_task, "test_flow", FLOW_TASK_STACK_BYTES, NULL, 5, &s_task);
+#endif
 }
 
 void test_flow_update(void)

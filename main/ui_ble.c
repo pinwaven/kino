@@ -13,6 +13,7 @@ static lv_obj_t *tile_root;
 static lv_timer_t *ble_timer;
 static bool ble_page_active;
 static bool ble_starting;
+static const BaseType_t APP_WORKER_TASK_CORE = 1;
 
 #define BLE_UI_FONT (&lv_font_source_han_sans_sc_16_cjk)
 
@@ -97,7 +98,11 @@ static void start_btn_event_cb(lv_event_t *e) {
         lv_label_set_text(result_label, "命令: --\nBT: 起动中");
     }
 
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+    if (xTaskCreatePinnedToCore(ble_start_task, "ble_start", 4096, NULL, 5, NULL, APP_WORKER_TASK_CORE) != pdPASS) {
+#else
     if (xTaskCreate(ble_start_task, "ble_start", 4096, NULL, 5, NULL) != pdPASS) {
+#endif
         ble_starting = false;
         if (result_label) {
             lv_label_set_text(result_label, "命令: --\nBT: 起动ERR");

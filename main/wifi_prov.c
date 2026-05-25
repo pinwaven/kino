@@ -20,6 +20,7 @@
 #include <errno.h>
 
 #define TAG "WIFI_PROV"
+#define APP_WORKER_TASK_CORE 1
 
 static volatile wifi_prov_state_t s_state = WIFI_PROV_STATE_IDLE;
 static char s_target_ssid[33] = {0};
@@ -605,7 +606,11 @@ esp_err_t wifi_prov_start(void)
 
     /* Start DNS captive portal (reduce stack if possible, 4096 is safe but generous) */
     s_dns_running = true;
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+    xTaskCreatePinnedToCore(dns_task, "wifi_prov_dns", 3072, NULL, 5, &s_dns_task_handle, APP_WORKER_TASK_CORE);
+#else
     xTaskCreate(dns_task, "wifi_prov_dns", 3072, NULL, 5, &s_dns_task_handle);
+#endif
 
     /* Start HTTP server */
     ret = start_httpd();
