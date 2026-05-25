@@ -123,10 +123,15 @@ static const int WAKE_HI_REQUIRED_SUCCESSES = 2;
 static const int WAKE_HI_MAX_ATTEMPTS = 8;
 static const uint32_t WAKE_HI_GAP_MS = 120;
 static const uint32_t WAKE_READY_SETTLE_MS = 300;
-static const uint32_t OVERLAY_LOGO_IDLE_COLOR = 0x748397;
-static const lv_opa_t OVERLAY_LOGO_IDLE_OPA = (lv_opa_t)220;
+static const uint32_t OVERLAY_LOGO_IDLE_COLOR = 0x92A2B8;
+static const lv_opa_t OVERLAY_LOGO_IDLE_OPA = (lv_opa_t)240;
 static const uint32_t OVERLAY_LOGO_WAKE_COLOR = 0x536170;
 static const lv_opa_t OVERLAY_LOGO_WAKE_OPA = LV_OPA_70;
+static const int OVERLAY_LOGO_BASE_X = 3;
+static const int OVERLAY_LOGO_BASE_Y = -18;
+static const int OVERLAY_LOGO_DRIFT_RADIUS_X = 16;
+static const int OVERLAY_LOGO_DRIFT_RADIUS_Y = 9;
+static const int OVERLAY_LOGO_DRIFT_PHASES = 24;
 static uint32_t network_recover_until_ms;
 static uint32_t keep_awake_until_ms;
 static uint32_t insert_card_wait_until_ms;
@@ -146,6 +151,7 @@ static QueueHandle_t s_power_worker_queue = NULL;
 static volatile bool s_sleep_request_pending = false;
 static volatile bool s_wake_request_pending = false;
 static volatile bool s_wake_sequence_active = false;
+static uint32_t s_overlay_logo_drift_step = 0;
 
 static void update_active_page(lv_obj_t *active_tile);
 static void show_main_flow(void);
@@ -287,6 +293,26 @@ static void power_worker_task(void *arg)
         }
         s_wake_request_pending = false;
     }
+}
+
+static void update_overlay_logo_idle_motion(void)
+{
+    if (!overlay_logo_label) {
+        return;
+    }
+
+    uint32_t phase = s_overlay_logo_drift_step++ % OVERLAY_LOGO_DRIFT_PHASES;
+    int angle = (int)(phase * 360 / OVERLAY_LOGO_DRIFT_PHASES);
+    int wave_angle = (angle + 90) % 360;
+    int ox = OVERLAY_LOGO_BASE_X + ((OVERLAY_LOGO_DRIFT_RADIUS_X * lv_trigo_sin(angle)) >> LV_TRIGO_SHIFT);
+    int oy = OVERLAY_LOGO_BASE_Y + ((OVERLAY_LOGO_DRIFT_RADIUS_Y * lv_trigo_sin(wave_angle)) >> LV_TRIGO_SHIFT);
+    lv_opa_t opa = (lv_opa_t)(OVERLAY_LOGO_IDLE_OPA - 8 +
+                              ((16 * (lv_trigo_sin((angle + 180) % 360) + LV_TRIGO_SIN_MAX)) >>
+                               (LV_TRIGO_SHIFT + 1)));
+
+    lv_obj_align(overlay_logo_label, LV_ALIGN_CENTER, ox, oy);
+    lv_obj_set_style_text_color(overlay_logo_label, lv_color_hex(OVERLAY_LOGO_IDLE_COLOR), 0);
+    lv_obj_set_style_text_opa(overlay_logo_label, opa, 0);
 }
 
 static void wifi_auto_connect_task(void *arg)
@@ -545,22 +571,7 @@ static void inactivity_timer_cb(lv_timer_t *t)
     uint32_t inactive_time = lv_display_get_inactive_time(NULL);
 
     if (is_dimmed) {
-        // OLED Screensaver: 微调 Logo 位置以防止烧屏
-        static int position_tick = 0;
-        if (overlay_logo_label) {
-            position_tick++;
-            if (position_tick >= 3) { // 每 3 秒（3次 Tick）漂移换位一次
-                position_tick = 0;
-                static int offset_idx = 0;
-                const int offsets_x[] = {3, 15, -10, 8, -12, 10, -5, 12};
-                const int offsets_y[] = {-18, -8, -25, -12, -22, -10, -28, -15};
-                int ox = offsets_x[offset_idx];
-                int oy = offsets_y[offset_idx];
-                offset_idx = (offset_idx + 1) % 8;
-                
-                lv_obj_align(overlay_logo_label, LV_ALIGN_CENTER, ox, oy);
-            }
-        }
+        update_overlay_logo_idle_motion();
 
         bool deep_sleep_enabled = ui_misc_is_deep_sleep_enabled();
         if (current_flow_state == TEST_FLOW_WAIT_CARD && !s_in_diagnostic && deep_sleep_enabled &&
@@ -633,6 +644,7 @@ static void inactivity_timer_cb(lv_timer_t *t)
         }
         is_dimmed = true;
         dimmed_start_time_ms = lv_tick_get();
+        s_overlay_logo_drift_step = 0;
         sleep_command_sent = false;
         if (flow_logo_label) {
             flow_logo_last_color = lv_color_hex(0x7B8794);
@@ -654,8 +666,7 @@ static void inactivity_timer_cb(lv_timer_t *t)
             }
         }
         if (overlay_logo_label) {
-            lv_obj_set_style_text_color(overlay_logo_label, lv_color_hex(OVERLAY_LOGO_IDLE_COLOR), 0);
-            lv_obj_set_style_text_opa(overlay_logo_label, OVERLAY_LOGO_IDLE_OPA, 0);
+            update_overlay_logo_idle_motion();
             set_obj_hidden(overlay_logo_label, !main_flow_visible);
         }
         ESP_LOGI(TAG, "Screen dimmed due to %dms inactivity", (int)inactive_time);
