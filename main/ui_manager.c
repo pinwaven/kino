@@ -119,6 +119,10 @@ static const int FLOW_GLINT_RADIUS = 213;
 static const int LOGO_SWEEP_STEPS = 8;
 static const int LOGO_SWEEP_TRAVERSALS = 6;
 static const BaseType_t APP_WORKER_TASK_CORE = 1;
+static const int WAKE_HI_REQUIRED_SUCCESSES = 2;
+static const int WAKE_HI_MAX_ATTEMPTS = 8;
+static const uint32_t WAKE_HI_GAP_MS = 120;
+static const uint32_t WAKE_READY_SETTLE_MS = 300;
 static const uint32_t OVERLAY_LOGO_IDLE_COLOR = 0x748397;
 static const lv_opa_t OVERLAY_LOGO_IDLE_OPA = (lv_opa_t)220;
 static const uint32_t OVERLAY_LOGO_WAKE_COLOR = 0x536170;
@@ -141,6 +145,7 @@ typedef enum {
 static QueueHandle_t s_power_worker_queue = NULL;
 static volatile bool s_sleep_request_pending = false;
 static volatile bool s_wake_request_pending = false;
+static volatile bool s_wake_sequence_active = false;
 
 static void update_active_page(lv_obj_t *active_tile);
 static void show_main_flow(void);
@@ -239,24 +244,46 @@ static void power_worker_task(void *arg)
         }
 
         if (sleep_command_sent) {
-            sleep_command_sent = false;
             ESP_LOGI(TAG, "Waking up STM32 after sleep");
-            bool success = false;
+            s_wake_sequence_active = true;
+            int success_count = 0;
             char resp_buf[64];
-            for (int retry = 0; retry < 5; retry++) {
-                ESP_LOGI(TAG, "Sending CMD_HI to wake up (attempt %d/5)", retry + 1);
+
+            for (int retry = 0; retry < WAKE_HI_MAX_ATTEMPTS && success_count < WAKE_HI_REQUIRED_SUCCESSES; retry++) {
+                ESP_LOGI(TAG,
+                         "Sending CMD_HI to wake up (attempt %d/%d success %d/%d)",
+                         retry + 1,
+                         WAKE_HI_MAX_ATTEMPTS,
+                         success_count,
+                         WAKE_HI_REQUIRED_SUCCESSES);
                 esp_err_t err = stm32_cmd_request_timeout(CMD_HI, NULL, 0, resp_buf, sizeof(resp_buf), 150);
                 if (err == ESP_OK && strncmp(resp_buf, "ver:", 4) == 0) {
-                    success = true;
-                    ESP_LOGI(TAG, "STM32 successfully woke up, response: %s", resp_buf);
-                    break;
+                    success_count++;
+                    ESP_LOGI(TAG, "STM32 wake HI ok %d/%d, response: %s",
+                             success_count,
+                             WAKE_HI_REQUIRED_SUCCESSES,
+                             resp_buf);
+                } else {
+                    success_count = 0;
                 }
-                vTaskDelay(pdMS_TO_TICKS(10));
+
+                if (success_count < WAKE_HI_REQUIRED_SUCCESSES) {
+                    vTaskDelay(pdMS_TO_TICKS(WAKE_HI_GAP_MS));
+                }
             }
-            if (!success) {
-                ESP_LOGE(TAG, "Failed to wake up STM32 after 5 attempts");
+
+            if (success_count >= WAKE_HI_REQUIRED_SUCCESSES) {
+                vTaskDelay(pdMS_TO_TICKS(WAKE_READY_SETTLE_MS));
+                sleep_command_sent = false;
+                ESP_LOGI(TAG, "STM32 wake confirmed by %d HI responses", success_count);
+            } else {
+                ESP_LOGE(TAG,
+                         "Failed to wake up STM32 after %d attempts with %d required HI responses",
+                         WAKE_HI_MAX_ATTEMPTS,
+                         WAKE_HI_REQUIRED_SUCCESSES);
                 test_flow_trigger_external_error(TEST_FLOW_CARD_DETECT_ERROR, "awake mcu failed\nreboot please..");
             }
+            s_wake_sequence_active = false;
         }
         s_wake_request_pending = false;
     }
@@ -786,6 +813,12 @@ static void disarm_wait_card_ui(void)
 static bool arm_wait_card_ui(void)
 {
     if (current_flow_state != TEST_FLOW_WAIT_CARD || flow_wait_card_armed) {
+        return false;
+    }
+    if (sleep_command_sent || s_sleep_request_pending || s_wake_request_pending ||
+        s_wake_sequence_active || !s_pm_lock_held) {
+        queue_power_request(POWER_WORKER_WAKE);
+        ESP_LOGI(TAG, "Insert Card ignored while STM32 wake confirmation is pending");
         return false;
     }
 
