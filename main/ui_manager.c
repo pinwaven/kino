@@ -16,9 +16,10 @@
 
 #define DIAG_PASSCODE "123"
 #define DIAG_PASSCODE_LEN 3
-#define DIAG_LONG_PRESS_MS 3140
-#define DIAG_LONG_PRESS_FEEDBACK_MS 1000
+#define DIAG_LONG_PRESS_MS 1800
+#define DIAG_LONG_PRESS_FEEDBACK_MS 350
 #define DIAG_LONG_PRESS_TICK_MS 50
+#define DIAG_PASS_FADE_MS 160
 
 static const char *TAG = "UI_MANAGER";
 
@@ -158,6 +159,8 @@ static void main_flow_click_cb(lv_event_t *e);
 static void diag_long_press_timer_cb(lv_timer_t *timer);
 static void cancel_diag_long_press(void);
 static void set_diag_long_press_feedback(bool active);
+static bool pass_overlay_visible(void);
+static void pass_overlay_open(void);
 static void disarm_wait_card_ui(void);
 static bool arm_wait_card_ui(void);
 static bool flow_retryable_error_state(test_flow_state_t state);
@@ -961,13 +964,16 @@ static void diag_long_press_timer_cb(lv_timer_t *timer)
         return;
     }
 
-    cancel_diag_long_press();
+    diag_long_press_tracking = false;
+    if (diag_long_press_timer) {
+        lv_timer_pause(diag_long_press_timer);
+    }
     stop_flow_logo_sweep();
     set_flow_glint_paused(true);
     set_flow_stage_scroll_hidden(true);
     diag_long_press_fired = true;
-    lv_obj_remove_flag(pass_tile, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_move_foreground(pass_tile);
+    pass_overlay_open();
+    set_diag_long_press_feedback(false);
     ESP_LOGI(TAG, "Diagnostic passcode page opened by long press");
 }
 
@@ -1065,13 +1071,40 @@ static void pass_overlay_close(void)
 
     if (pass_tile) {
         lv_obj_add_flag(pass_tile, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_opa(pass_tile, LV_OPA_COVER, 0);
     }
 
     if (!s_in_diagnostic && main_page && !lv_obj_has_flag(main_page, LV_OBJ_FLAG_HIDDEN)) {
+        if (current_flow_state == TEST_FLOW_WAIT_CARD) {
+            disarm_wait_card_ui();
+        }
         set_flow_stage_scroll_hidden(false);
+        update_test_flow_ui();
+        update_flow_stage_visuals(current_flow_state);
         update_flow_logo_effect(current_flow_state);
+        lv_display_trigger_activity(NULL);
     }
 
+}
+
+static bool pass_overlay_visible(void)
+{
+    return pass_tile && !lv_obj_has_flag(pass_tile, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void pass_overlay_open(void)
+{
+    if (!pass_tile) {
+        return;
+    }
+
+    if (pass_code_label) {
+        lv_label_set_text(pass_code_label, "");
+    }
+    lv_obj_set_style_opa(pass_tile, LV_OPA_TRANSP, 0);
+    lv_obj_remove_flag(pass_tile, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(pass_tile);
+    lv_obj_fade_in(pass_tile, DIAG_PASS_FADE_MS, 0);
 }
 
 static void pass_digit_cb(lv_event_t *e)
@@ -1857,6 +1890,9 @@ static void main_flow_press_cb(lv_event_t *e)
     lv_event_code_t code = lv_event_get_code(e);
 
     if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        if (diag_long_press_fired || pass_overlay_visible()) {
+            return;
+        }
         cancel_diag_long_press();
         return;
     }
@@ -1894,6 +1930,10 @@ static void main_flow_click_cb(lv_event_t *e)
 
     if (diag_long_press_fired) {
         diag_long_press_fired = false;
+        return;
+    }
+
+    if (pass_overlay_visible()) {
         return;
     }
 
