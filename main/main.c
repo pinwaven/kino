@@ -60,16 +60,133 @@ static void init_nvs_tolerant(void)
     ESP_LOGI(TAG, "nvs ready");
 }
 
+// 声明字库
+LV_FONT_DECLARE(lv_font_montserrat_48);
+
+// 启动动画属性设置回调
+static void set_logo_opa_cb(void *var, int32_t val)
+{
+    lv_obj_set_style_text_opa((lv_obj_t *)var, (lv_opa_t)val, 0);
+}
+
+static void set_arc_value_cb(void *var, int32_t val)
+{
+    lv_arc_set_value((lv_obj_t *)var, val);
+}
+
+static void set_arc_rotation_cb(void *var, int32_t val)
+{
+    lv_arc_set_rotation((lv_obj_t *)var, val);
+}
+
+static void set_arc_opa_cb(void *var, int32_t val)
+{
+    lv_obj_set_style_arc_opa((lv_obj_t *)var, (lv_opa_t)val, LV_PART_MAIN);
+    lv_obj_set_style_arc_opa((lv_obj_t *)var, (lv_opa_t)val, LV_PART_INDICATOR);
+}
+
+static void show_boot_animation(void)
+{
+    lv_obj_t *scr = lv_scr_act();
+    
+    // 1. 设置屏幕背景为暗色调
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x0B1C2E), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+
+    // 2. 创建圆弧 (外环进度圈)
+    lv_obj_t *arc = lv_arc_create(scr);
+    lv_obj_set_size(arc, 180, 180);
+    lv_obj_center(arc);
+    lv_arc_set_bg_angles(arc, 0, 360);
+    lv_arc_set_value(arc, 0);
+    
+    // 隐藏圆弧自带的滑块 Knob
+    lv_obj_set_style_bg_opa(arc, LV_OPA_TRANSP, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(arc, 0, LV_PART_KNOB);
+    
+    // 设置圆弧线宽和渐变颜色
+    lv_obj_set_style_arc_width(arc, 5, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(arc, 5, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(arc, lv_color_hex(0x13263B), LV_PART_MAIN);       // 暗背景轨道
+    lv_obj_set_style_arc_color(arc, lv_color_hex(0x00E5FF), LV_PART_INDICATOR);  // 亮丽青色指示器
+    lv_obj_set_style_arc_opa(arc, LV_OPA_0, LV_PART_MAIN);
+    lv_obj_set_style_arc_opa(arc, LV_OPA_0, LV_PART_INDICATOR);
+    lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+
+    // 3. 创建居中 KINO 文本
+    lv_obj_t *logo = lv_label_create(scr);
+    lv_label_set_text(logo, "KINO");
+    lv_obj_set_style_text_font(logo, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(logo, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_letter_space(logo, 6, 0);
+    lv_obj_set_style_text_opa(logo, LV_OPA_0, 0);
+    lv_obj_align(logo, LV_ALIGN_CENTER, 3, 0);  // 稍微偏移字间距带来的中心错位
+
+    // 4. 配置并启动所有动画序列
+    // Logo 渐显 (0 - 800ms)
+    lv_anim_t a_logo_in;
+    lv_anim_init(&a_logo_in);
+    lv_anim_set_var(&a_logo_in, logo);
+    lv_anim_set_values(&a_logo_in, LV_OPA_0, LV_OPA_COVER);
+    lv_anim_set_time(&a_logo_in, 800);
+    lv_anim_set_exec_cb(&a_logo_in, set_logo_opa_cb);
+    lv_anim_start(&a_logo_in);
+
+    // Logo 渐隐 (2200 - 3000ms)
+    lv_anim_t a_logo_out;
+    lv_anim_init(&a_logo_out);
+    lv_anim_set_var(&a_logo_out, logo);
+    lv_anim_set_values(&a_logo_out, LV_OPA_COVER, LV_OPA_0);
+    lv_anim_set_time(&a_logo_out, 800);
+    lv_anim_set_delay(&a_logo_out, 2200);
+    lv_anim_set_exec_cb(&a_logo_out, set_logo_opa_cb);
+    lv_anim_start(&a_logo_out);
+
+    // 圆弧渐显 (0 - 800ms)
+    lv_anim_t a_arc_in;
+    lv_anim_init(&a_arc_in);
+    lv_anim_set_var(&a_arc_in, arc);
+    lv_anim_set_values(&a_arc_in, LV_OPA_0, LV_OPA_COVER);
+    lv_anim_set_time(&a_arc_in, 800);
+    lv_anim_set_exec_cb(&a_arc_in, set_arc_opa_cb);
+    lv_anim_start(&a_arc_in);
+
+    // 圆弧进度填满 (0 - 2200ms)
+    lv_anim_t a_arc_val;
+    lv_anim_init(&a_arc_val);
+    lv_anim_set_var(&a_arc_val, arc);
+    lv_anim_set_values(&a_arc_val, 0, 100);
+    lv_anim_set_time(&a_arc_val, 2200);
+    lv_anim_set_exec_cb(&a_arc_val, set_arc_value_cb);
+    lv_anim_start(&a_arc_val);
+
+    // 圆弧持续匀速旋转 (0 - 3000ms)
+    lv_anim_t a_arc_rot;
+    lv_anim_init(&a_arc_rot);
+    lv_anim_set_var(&a_arc_rot, arc);
+    lv_anim_set_values(&a_arc_rot, 0, 360);
+    lv_anim_set_time(&a_arc_rot, 3000);
+    lv_anim_set_exec_cb(&a_arc_rot, set_arc_rotation_cb);
+    lv_anim_start(&a_arc_rot);
+
+    // 圆弧渐隐 (2200 - 3000ms)
+    lv_anim_t a_arc_out;
+    lv_anim_init(&a_arc_out);
+    lv_anim_set_var(&a_arc_out, arc);
+    lv_anim_set_values(&a_arc_out, LV_OPA_COVER, LV_OPA_0);
+    lv_anim_set_time(&a_arc_out, 800);
+    lv_anim_set_delay(&a_arc_out, 2200);
+    lv_anim_set_exec_cb(&a_arc_out, set_arc_opa_cb);
+    lv_anim_start(&a_arc_out);
+}
+
 void app_main(void)
 {
     init_cjson_psram_hooks();
     log_boot_info();
     init_nvs_tolerant();
 
-    // 初始化串口接口
-    ESP_LOGI(TAG, "stm32 interface init");
-    stm32_interface_init();
-
+    // 1. 立即启动屏幕背光与 LVGL 底层引擎
     ESP_LOGI(TAG, "display start");
     lv_display_t *disp = bsp_display_start();
     if (!disp) {
@@ -85,7 +202,21 @@ void app_main(void)
     ESP_LOGI(TAG, "brightness set");
     bsp_display_brightness_set(50);
 
-    // 初始化自定义 UI
+    // 2. 加载并展示 3 秒优雅的启动动画
+    ESP_LOGI(TAG, "show boot animation");
+    show_boot_animation();
+
+    bsp_display_unlock();
+
+    // 3. 保持屏幕运行动画，主任务在此阻塞等待 3 秒
+    vTaskDelay(pdMS_TO_TICKS(3000));
+
+    // 4. 动画结束后，执行其余后台硬件及串口初始化
+    ESP_LOGI(TAG, "stm32 interface init");
+    stm32_interface_init();
+
+    // 5. 初始化主应用程序 UI 并加载主屏幕
+    bsp_display_lock(-1);
     ESP_LOGI(TAG, "ui init");
     ui_init();
     ESP_LOGI(TAG, "ui ready");
