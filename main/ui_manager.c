@@ -6,6 +6,7 @@
 #include "test_flow.h"
 #include "stm32_interface.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "esp_pm.h"
 #include "esp_sleep.h"
@@ -118,15 +119,28 @@ static const int FLOW_GLINT_RADIUS = 213;
 static const int LOGO_SWEEP_STEPS = 8;
 static const int LOGO_SWEEP_TRAVERSALS = 6;
 static const BaseType_t APP_WORKER_TASK_CORE = 1;
+static const uint32_t OVERLAY_LOGO_IDLE_COLOR = 0x748397;
+static const lv_opa_t OVERLAY_LOGO_IDLE_OPA = (lv_opa_t)220;
+static const uint32_t OVERLAY_LOGO_WAKE_COLOR = 0x536170;
+static const lv_opa_t OVERLAY_LOGO_WAKE_OPA = LV_OPA_70;
 static uint32_t network_recover_until_ms;
 static uint32_t keep_awake_until_ms;
 static uint32_t insert_card_wait_until_ms;
 static test_flow_state_t last_flow_state = TEST_FLOW_PREP_HOMING;
 static test_flow_state_t current_flow_state = TEST_FLOW_PREP_HOMING;
 static uint32_t dimmed_start_time_ms = 0;
-static bool sleep_command_sent = false;
+static volatile bool sleep_command_sent = false;
 static esp_pm_lock_handle_t s_light_sleep_lock = NULL;
-static bool s_pm_lock_held = true;
+static volatile bool s_pm_lock_held = true;
+
+typedef enum {
+    POWER_WORKER_SLEEP,
+    POWER_WORKER_WAKE,
+} power_worker_req_t;
+
+static QueueHandle_t s_power_worker_queue = NULL;
+static volatile bool s_sleep_request_pending = false;
+static volatile bool s_wake_request_pending = false;
 
 static void update_active_page(lv_obj_t *active_tile);
 static void show_main_flow(void);
@@ -158,6 +172,95 @@ static void diag_exit_overlay_hide(void);
 static void diag_exit_overlay_show(void);
 static lv_obj_t *diag_normalize_active_tile(lv_obj_t *active_tile);
 static void diag_loop_fx_play(bool from_left);
+
+static bool queue_power_request(power_worker_req_t req)
+{
+    volatile bool *pending = req == POWER_WORKER_SLEEP ? &s_sleep_request_pending : &s_wake_request_pending;
+
+    if (!s_power_worker_queue) {
+        ESP_LOGW(TAG, "power worker queue unavailable");
+        return false;
+    }
+    if (*pending) {
+        return true;
+    }
+
+    *pending = true;
+    if (xQueueSend(s_power_worker_queue, &req, 0) == pdTRUE) {
+        return true;
+    }
+
+    *pending = false;
+    ESP_LOGW(TAG, "power worker queue full");
+    return false;
+}
+
+static void power_worker_task(void *arg)
+{
+    (void)arg;
+    power_worker_req_t req;
+
+    while (xQueueReceive(s_power_worker_queue, &req, portMAX_DELAY) == pdTRUE) {
+        if (req == POWER_WORKER_SLEEP) {
+            ESP_LOGI(TAG, "Sending sleep command to STM32");
+            esp_err_t err = stm32_cmd_send_action(CMD_SLEEP, NULL, 0);
+            if (err == ESP_OK) {
+                sleep_command_sent = true;
+                ESP_LOGI(TAG, "Sleep command sent to STM32 successfully");
+
+                ESP_LOGI(TAG, "Stopping Wi-Fi radio for deep sleep");
+                esp_wifi_stop();
+
+                if (s_light_sleep_lock && s_pm_lock_held) {
+                    esp_pm_lock_release(s_light_sleep_lock);
+                    s_pm_lock_held = false;
+                    ESP_LOGI(TAG, "Released PM lock, allowing ESP32 Light Sleep");
+                }
+            } else {
+                ESP_LOGE(TAG, "Failed to send sleep command to STM32: %s", esp_err_to_name(err));
+            }
+            s_sleep_request_pending = false;
+            continue;
+        }
+
+        if (s_light_sleep_lock && !s_pm_lock_held) {
+            esp_pm_lock_acquire(s_light_sleep_lock);
+            s_pm_lock_held = true;
+            ESP_LOGI(TAG, "Acquired PM lock, preventing ESP32 Light Sleep");
+
+            ESP_LOGI(TAG, "Starting Wi-Fi radio on wakeup");
+            esp_err_t start_err = esp_wifi_start();
+            if (start_err == ESP_OK) {
+                ESP_LOGI(TAG, "Triggering Wi-Fi reconnection");
+                esp_wifi_connect();
+            } else {
+                ESP_LOGE(TAG, "Failed to start Wi-Fi radio: %s", esp_err_to_name(start_err));
+            }
+        }
+
+        if (sleep_command_sent) {
+            sleep_command_sent = false;
+            ESP_LOGI(TAG, "Waking up STM32 after sleep");
+            bool success = false;
+            char resp_buf[64];
+            for (int retry = 0; retry < 5; retry++) {
+                ESP_LOGI(TAG, "Sending CMD_HI to wake up (attempt %d/5)", retry + 1);
+                esp_err_t err = stm32_cmd_request_timeout(CMD_HI, NULL, 0, resp_buf, sizeof(resp_buf), 150);
+                if (err == ESP_OK && strncmp(resp_buf, "ver:", 4) == 0) {
+                    success = true;
+                    ESP_LOGI(TAG, "STM32 successfully woke up, response: %s", resp_buf);
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            if (!success) {
+                ESP_LOGE(TAG, "Failed to wake up STM32 after 5 attempts");
+                test_flow_trigger_external_error(TEST_FLOW_CARD_DETECT_ERROR, "awake mcu failed\nreboot please..");
+            }
+        }
+        s_wake_request_pending = false;
+    }
+}
 
 static void wifi_auto_connect_task(void *arg)
 {
@@ -204,44 +307,12 @@ static void restore_screen_now(void)
     if (was_dimmed) {
         last_dim_restore_ms = lv_tick_get();
         if (overlay_logo_label) {
-            lv_obj_set_style_text_color(overlay_logo_label, lv_color_hex(0x536170), 0);
-            lv_obj_set_style_text_opa(overlay_logo_label, LV_OPA_70, 0);
+            lv_obj_set_style_text_color(overlay_logo_label, lv_color_hex(OVERLAY_LOGO_WAKE_COLOR), 0);
+            lv_obj_set_style_text_opa(overlay_logo_label, OVERLAY_LOGO_WAKE_OPA, 0);
             lv_obj_align(overlay_logo_label, LV_ALIGN_CENTER, 3, -18);
         }
-        if (s_light_sleep_lock && !s_pm_lock_held) {
-            esp_pm_lock_acquire(s_light_sleep_lock);
-            s_pm_lock_held = true;
-            ESP_LOGI(TAG, "Acquired PM lock, preventing ESP32 Light Sleep");
-            
-            // 重新拉起 Wi-Fi 射频以进行网络通信
-            ESP_LOGI(TAG, "Starting Wi-Fi radio on wakeup...");
-            esp_err_t start_err = esp_wifi_start();
-            if (start_err == ESP_OK) {
-                ESP_LOGI(TAG, "Triggering Wi-Fi reconnection...");
-                esp_wifi_connect();
-            } else {
-                ESP_LOGE(TAG, "Failed to start Wi-Fi radio: %s", esp_err_to_name(start_err));
-            }
-        }
-        if (sleep_command_sent) {
-            sleep_command_sent = false;
-            ESP_LOGI(TAG, "Waking up STM32 after sleep...");
-            bool success = false;
-            char resp_buf[64];
-            for (int retry = 0; retry < 5; retry++) {
-                ESP_LOGI(TAG, "Sending CMD_HI to wake up (attempt %d/5)", retry + 1);
-                esp_err_t err = stm32_cmd_request_timeout(CMD_HI, NULL, 0, resp_buf, sizeof(resp_buf), 150);
-                if (err == ESP_OK && strncmp(resp_buf, "ver:", 4) == 0) {
-                    success = true;
-                    ESP_LOGI(TAG, "STM32 successfully woke up, response: %s", resp_buf);
-                    break;
-                }
-                vTaskDelay(pdMS_TO_TICKS(10));
-            }
-            if (!success) {
-                ESP_LOGE(TAG, "Failed to wake up STM32 after 5 attempts!");
-                test_flow_trigger_external_error(TEST_FLOW_CARD_DETECT_ERROR, "awake mcu failed\nreboot please..");
-            }
+        if (sleep_command_sent || s_sleep_request_pending || !s_pm_lock_held) {
+            queue_power_request(POWER_WORKER_WAKE);
         }
         if (main_tv && lv_tileview_get_tile_active(main_tv) == main_tile) {
             cancel_flow_stage_restore();
@@ -465,33 +536,16 @@ static void inactivity_timer_cb(lv_timer_t *t)
         }
 
         bool deep_sleep_enabled = ui_misc_is_deep_sleep_enabled();
-        if (current_flow_state == TEST_FLOW_WAIT_CARD && !s_in_diagnostic && deep_sleep_enabled && !sleep_command_sent) {
+        if (current_flow_state == TEST_FLOW_WAIT_CARD && !s_in_diagnostic && deep_sleep_enabled &&
+            !sleep_command_sent && !s_sleep_request_pending) {
             uint32_t dimmed_duration = lv_tick_get() - dimmed_start_time_ms;
             if (dimmed_duration >= 50000) { // 50 seconds (50,000 ms)
-                ESP_LOGI(TAG, "Screen dimmed for >50 seconds. Sending sleep command to STM32.");
-                esp_err_t err = stm32_cmd_send_action(CMD_SLEEP, NULL, 0);
-                if (err == ESP_OK) {
-                    sleep_command_sent = true;
-                    ESP_LOGI(TAG, "Sleep command sent to STM32 successfully.");
-                    
-                    // 将 Logo 亮度提升约 10%
-                    if (overlay_logo_label) {
-                        lv_obj_set_style_text_color(overlay_logo_label, lv_color_hex(0x647385), 0);
-                        lv_obj_set_style_text_opa(overlay_logo_label, LV_OPA_80, 0);
-                    }
-                    
-                    // 彻底关闭 Wi-Fi 射频以节省 80-120mA 功耗
-                    ESP_LOGI(TAG, "Stopping Wi-Fi radio for deep sleep...");
-                    esp_wifi_stop();
-                    
-                    if (s_light_sleep_lock && s_pm_lock_held) {
-                        esp_pm_lock_release(s_light_sleep_lock);
-                        s_pm_lock_held = false;
-                        ESP_LOGI(TAG, "Released PM lock, allowing ESP32 Light Sleep");
-                    }
-                } else {
-                    ESP_LOGE(TAG, "Failed to send sleep command to STM32: %s", esp_err_to_name(err));
+                ESP_LOGI(TAG, "Screen dimmed for >50 seconds, queueing sleep command");
+                if (overlay_logo_label) {
+                    lv_obj_set_style_text_color(overlay_logo_label, lv_color_hex(OVERLAY_LOGO_IDLE_COLOR), 0);
+                    lv_obj_set_style_text_opa(overlay_logo_label, OVERLAY_LOGO_IDLE_OPA, 0);
                 }
+                queue_power_request(POWER_WORKER_SLEEP);
             }
         }
     }
@@ -573,6 +627,8 @@ static void inactivity_timer_cb(lv_timer_t *t)
             }
         }
         if (overlay_logo_label) {
+            lv_obj_set_style_text_color(overlay_logo_label, lv_color_hex(OVERLAY_LOGO_IDLE_COLOR), 0);
+            lv_obj_set_style_text_opa(overlay_logo_label, OVERLAY_LOGO_IDLE_OPA, 0);
             set_obj_hidden(overlay_logo_label, !main_flow_visible);
         }
         ESP_LOGI(TAG, "Screen dimmed due to %dms inactivity", (int)inactive_time);
@@ -2112,6 +2168,24 @@ void ui_init(void)
         esp_sleep_enable_gpio_wakeup();
         gpio_wakeup_enable(BSP_LCD_TOUCH_INT, GPIO_INTR_LOW_LEVEL);
         ESP_LOGI(TAG, "GPIO wakeup enabled on TOUCH_INT (GPIO %d)", BSP_LCD_TOUCH_INT);
+    }
+
+    if (!s_power_worker_queue) {
+        s_power_worker_queue = xQueueCreate(4, sizeof(power_worker_req_t));
+        if (!s_power_worker_queue) {
+            ESP_LOGE(TAG, "power worker queue create failed");
+        } else {
+#if CONFIG_FREERTOS_NUMBER_OF_CORES > 1
+            BaseType_t ok = xTaskCreatePinnedToCore(power_worker_task, "power_worker", 4096, NULL, 5, NULL, APP_WORKER_TASK_CORE);
+#else
+            BaseType_t ok = xTaskCreate(power_worker_task, "power_worker", 4096, NULL, 5, NULL);
+#endif
+            if (ok != pdPASS) {
+                ESP_LOGE(TAG, "power worker task create failed");
+                vQueueDelete(s_power_worker_queue);
+                s_power_worker_queue = NULL;
+            }
+        }
     }
 
     overlay = lv_obj_create(lv_layer_top());
