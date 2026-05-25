@@ -116,6 +116,8 @@ static uint32_t keep_awake_until_ms;
 static uint32_t insert_card_wait_until_ms;
 static test_flow_state_t last_flow_state = TEST_FLOW_PREP_HOMING;
 static test_flow_state_t current_flow_state = TEST_FLOW_PREP_HOMING;
+static uint32_t dimmed_start_time_ms = 0;
+static bool sleep_command_sent = false;
 
 static void update_active_page(lv_obj_t *active_tile);
 static void show_main_flow(void);
@@ -192,6 +194,26 @@ static void restore_screen_now(void)
     }
     if (was_dimmed) {
         last_dim_restore_ms = lv_tick_get();
+        if (sleep_command_sent) {
+            sleep_command_sent = false;
+            ESP_LOGI(TAG, "Waking up STM32 after sleep...");
+            bool success = false;
+            char resp_buf[64];
+            for (int retry = 0; retry < 3; retry++) {
+                ESP_LOGI(TAG, "Sending CMD_HI to wake up (attempt %d/3)", retry + 1);
+                esp_err_t err = stm32_cmd_request_timeout(CMD_HI, NULL, 0, resp_buf, sizeof(resp_buf), 150);
+                if (err == ESP_OK && strncmp(resp_buf, "ver:", 4) == 0) {
+                    success = true;
+                    ESP_LOGI(TAG, "STM32 successfully woke up, response: %s", resp_buf);
+                    break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            if (!success) {
+                ESP_LOGE(TAG, "Failed to wake up STM32 after 3 attempts!");
+                test_flow_trigger_external_error(TEST_FLOW_CARD_DETECT_ERROR, "awake mcu failed\nreboot please..");
+            }
+        }
         if (main_tv && lv_tileview_get_tile_active(main_tv) == main_tile) {
             cancel_flow_stage_restore();
             set_flow_stage_scroll_hidden(false);
@@ -395,6 +417,22 @@ static void inactivity_timer_cb(lv_timer_t *t)
     (void)t;
     uint32_t inactive_time = lv_display_get_inactive_time(NULL);
 
+    if (is_dimmed) {
+        if (current_flow_state == TEST_FLOW_WAIT_CARD && !sleep_command_sent) {
+            uint32_t dimmed_duration = lv_tick_get() - dimmed_start_time_ms;
+            if (dimmed_duration >= 120000) { // 2 minutes (120,000 ms)
+                ESP_LOGI(TAG, "Screen dimmed for >2 minutes. Sending sleep command to STM32.");
+                esp_err_t err = stm32_cmd_send_action(CMD_SLEEP, NULL, 0);
+                if (err == ESP_OK) {
+                    sleep_command_sent = true;
+                    ESP_LOGI(TAG, "Sleep command sent to STM32 successfully.");
+                } else {
+                    ESP_LOGE(TAG, "Failed to send sleep command to STM32: %s", esp_err_to_name(err));
+                }
+            }
+        }
+    }
+
     if (!allow_auto_dim) {
         if (is_dimmed) {
             restore_screen_now();
@@ -447,6 +485,8 @@ static void inactivity_timer_cb(lv_timer_t *t)
             lv_timer_set_period(lv_display_get_refr_timer(NULL), REFR_PERIOD_DIMMED);
         }
         is_dimmed = true;
+        dimmed_start_time_ms = lv_tick_get();
+        sleep_command_sent = false;
         if (flow_logo_label) {
             flow_logo_last_color = lv_color_hex(0x7B8794);
             lv_obj_set_style_text_color(flow_logo_label, flow_logo_last_color, 0);

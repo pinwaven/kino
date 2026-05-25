@@ -53,5 +53,6 @@ void test_flow_get_snapshot(test_flow_snapshot_t *out);
 const char *test_flow_status_text(test_flow_state_t state);
 const char *test_flow_hint_text(const test_flow_snapshot_t *snapshot);
 bool test_flow_uses_large_error_layout(const char *message);
+void test_flow_trigger_external_error(test_flow_state_t state, const char *message);
 
 #endif

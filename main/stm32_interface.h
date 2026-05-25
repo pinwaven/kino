@@ -16,6 +16,7 @@
 #define CMD_GPIO_WRITE      0x07
 #define CMD_ACTION_CANCEL   0x08
 #define CMD_BMSINFO         0x0C
+#define CMD_SLEEP           0x0D
 #define CMD_NFC_UUID        0x11
 #define CMD_NFC_RECORD_READ 0x12
 #define CMD_ACTION_HOMING   0x40

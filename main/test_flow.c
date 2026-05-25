@@ -833,3 +833,11 @@ const char *test_flow_hint_text(const test_flow_snapshot_t *snapshot)
     snprintf(s_hint, sizeof(s_hint), "Waiting... cd:%d adc1:%d", snapshot->cd_value, snapshot->adc1_value);
     return s_hint;
 }
+
+void test_flow_trigger_external_error(test_flow_state_t state, const char *message)
+{
+    lock_flow();
+    set_state_locked(state);
+    set_last_error_message_locked(message);
+    unlock_flow();
+}
