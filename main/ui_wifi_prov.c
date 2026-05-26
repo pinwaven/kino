@@ -7,6 +7,8 @@
 #define TAG "UI_WIFI_PROV"
 #define QR_SIZE 200
 #define PROV_STOP_DELAY_MS 2000
+#define WIFI_PROV_REFR_PERIOD_MS 200
+#define WIFI_PROV_REFR_NORMAL_MS 16
 
 /* QR code WiFi URI: phone camera scans this and auto-connects to AP */
 #define QR_DATA "WIFI:T:WPA;S:" WIFI_PROV_AP_SSID ";P:" WIFI_PROV_AP_PASS ";;"
@@ -18,11 +20,23 @@ static lv_obj_t *status_label;
 static lv_timer_t *update_timer;
 
 static wifi_prov_state_t last_state = WIFI_PROV_STATE_IDLE - 1; /* force first draw */
+static char last_target_ssid[33];
+static char last_got_ip[16];
+static int8_t last_rssi;
+static bool last_rssi_valid;
 static bool page_active = false;
 static lv_timer_t *stop_delay_timer = NULL;
 
 static lv_obj_t *reprov_btn = NULL;
 static lv_obj_t *reprov_btn_label = NULL;
+
+static void set_display_refresh_period(uint32_t period_ms)
+{
+    lv_timer_t *refr = lv_display_get_refr_timer(NULL);
+    if (refr) {
+        lv_timer_set_period(refr, period_ms);
+    }
+}
 
 /* ---- prov start/stop worker integration ---------------------------------- */
 
@@ -89,6 +103,7 @@ static void cancel_stop_delay(void)
         lv_timer_delete(stop_delay_timer);
         stop_delay_timer = NULL;
     }
+    s_stop_after_task = false;
 }
 
 static void stop_delay_timer_cb(lv_timer_t *timer)
@@ -112,6 +127,7 @@ static void reprov_btn_click_cb(lv_event_t *e)
 {
     (void)e;
     cancel_stop_delay();
+    set_display_refresh_period(WIFI_PROV_REFR_PERIOD_MS);
 
     last_state = (wifi_prov_state_t)(WIFI_PROV_STATE_IDLE - 1); /* force redraw */
     lv_label_set_text(status_label, "Starting hotspot...");
@@ -130,16 +146,35 @@ static void update_timer_cb(lv_timer_t *timer)
     wifi_prov_status_t st;
     wifi_prov_get_status(&st);
 
-    if (st.state == last_state) return;
+    if (st.state == last_state &&
+        strcmp(st.target_ssid, last_target_ssid) == 0 &&
+        strcmp(st.got_ip, last_got_ip) == 0 &&
+        st.rssi == last_rssi &&
+        st.rssi_valid == last_rssi_valid) {
+        return;
+    }
     last_state = st.state;
+    strlcpy(last_target_ssid, st.target_ssid, sizeof(last_target_ssid));
+    strlcpy(last_got_ip, st.got_ip, sizeof(last_got_ip));
+    last_rssi = st.rssi;
+    last_rssi_valid = st.rssi_valid;
 
     /* reset text colour first */
     lv_obj_set_style_text_color(status_label, lv_color_hex(0xCCCCCC), 0);
 
     if (st.got_ip[0] != '\0' &&
         (st.state == WIFI_PROV_STATE_IDLE || st.state == WIFI_PROV_STATE_CONNECTED)) {
+        set_display_refresh_period(WIFI_PROV_REFR_NORMAL_MS);
         show_qr(false);
-        lv_label_set_text_fmt(status_label, "Current WiFi\nSSID: %s\nIP: %s", st.target_ssid, st.got_ip);
+        if (st.rssi_valid) {
+            lv_label_set_text_fmt(status_label,
+                                  "Current WiFi\nSSID: %s\nIP: %s\nSignal: %d dBm",
+                                  st.target_ssid,
+                                  st.got_ip,
+                                  st.rssi);
+        } else {
+            lv_label_set_text_fmt(status_label, "Current WiFi\nSSID: %s\nIP: %s\nSignal: --", st.target_ssid, st.got_ip);
+        }
         lv_obj_set_style_text_color(status_label, lv_color_hex(0x2ECC71), 0);
         return;
     }
@@ -157,16 +192,22 @@ static void update_timer_cb(lv_timer_t *timer)
 
     case WIFI_PROV_STATE_CONNECTING:
         show_qr(false);
-        if (reprov_btn) {
-            lv_obj_add_flag(reprov_btn, LV_OBJ_FLAG_HIDDEN);
-        }
-        lv_label_set_text_fmt(status_label, "Connecting to %s...", st.target_ssid);
+        lv_label_set_text_fmt(status_label, "Current WiFi\nSSID: %s\nConnecting...", st.target_ssid);
         lv_obj_set_style_text_color(status_label, lv_color_hex(0xFF9800), 0);
         break;
 
     case WIFI_PROV_STATE_CONNECTED:
+        set_display_refresh_period(WIFI_PROV_REFR_NORMAL_MS);
         show_qr(false);
-        lv_label_set_text_fmt(status_label, "Current WiFi\nSSID: %s\nIP: %s", st.target_ssid, st.got_ip);
+        if (st.rssi_valid) {
+            lv_label_set_text_fmt(status_label,
+                                  "Current WiFi\nSSID: %s\nIP: %s\nSignal: %d dBm",
+                                  st.target_ssid,
+                                  st.got_ip,
+                                  st.rssi);
+        } else {
+            lv_label_set_text_fmt(status_label, "Current WiFi\nSSID: %s\nIP: %s\nSignal: --", st.target_ssid, st.got_ip);
+        }
         lv_obj_set_style_text_color(status_label, lv_color_hex(0x2ECC71), 0);
         break;
 
@@ -191,6 +232,7 @@ void ui_wifi_prov_set_active(bool active)
         lv_timer_resume(update_timer);
         lv_timer_ready(update_timer);
     } else {
+        set_display_refresh_period(WIFI_PROV_REFR_NORMAL_MS);
         lv_timer_pause(update_timer);
         show_qr(false);
         if (!stop_delay_timer) {
@@ -204,6 +246,7 @@ void ui_wifi_prov_force_stop_now(void)
 {
     page_active = false;
     cancel_stop_delay();
+    set_display_refresh_period(WIFI_PROV_REFR_NORMAL_MS);
 
     if (update_timer) {
         lv_timer_pause(update_timer);

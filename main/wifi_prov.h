@@ -20,6 +20,8 @@ typedef struct {
     wifi_prov_state_t state;
     char target_ssid[33];
     char got_ip[16];
+    int8_t rssi;
+    bool rssi_valid;
 } wifi_prov_status_t;
 
 esp_err_t wifi_prov_start(void);

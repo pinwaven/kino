@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs_flash.h"
@@ -17,8 +18,371 @@
 #include "ui_app.h"
 #include "nano_api.h"
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
 
 static const char *TAG = "APP_MAIN";
+static const char *AXP2101_TAG = "AXP2101";
+
+#define AXP2101_I2C_ADDR 0x34
+#define AXP2101_DC_UVP_POWEROFF_MASK 0x1F
+#define BOOT_BRIGHTNESS_START 18
+#define BOOT_BRIGHTNESS_TARGET 75
+
+static esp_err_t axp2101_read_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t *value)
+{
+    return i2c_master_transmit_receive(dev, &reg, sizeof(reg), value, sizeof(*value), 100);
+}
+
+static esp_err_t axp2101_write_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t value)
+{
+    uint8_t data[] = {reg, value};
+    return i2c_master_transmit(dev, data, sizeof(data), 100);
+}
+
+static esp_err_t axp2101_update_bits(i2c_master_dev_handle_t dev, uint8_t reg, uint8_t mask, uint8_t value)
+{
+    uint8_t old_value = 0;
+    esp_err_t ret = axp2101_read_reg(dev, reg, &old_value);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    return axp2101_write_reg(dev, reg, (old_value & ~mask) | (value & mask));
+}
+
+static esp_err_t __attribute__((unused)) axp2101_pmu_restart(i2c_master_dev_handle_t dev)
+{
+    return axp2101_update_bits(dev, 0x10, 0x02, 0x02);
+}
+
+static esp_err_t __attribute__((unused)) axp2101_soft_poweroff(i2c_master_dev_handle_t dev)
+{
+    return axp2101_update_bits(dev, 0x10, 0x01, 0x01);
+}
+
+static void axp2101_disable_dcdc_uvp_poweroff(i2c_master_dev_handle_t dev)
+{
+    uint8_t old_value = 0;
+    esp_err_t ret = axp2101_read_reg(dev, 0x23, &old_value);
+    if (ret != ESP_OK) {
+        ESP_LOGW(AXP2101_TAG, "read REG23 before UVP disable failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ret = axp2101_update_bits(dev, 0x23, AXP2101_DC_UVP_POWEROFF_MASK, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGW(AXP2101_TAG, "disable DCDC UVP poweroff failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    uint8_t new_value = 0;
+    ret = axp2101_read_reg(dev, 0x23, &new_value);
+    if (ret == ESP_OK) {
+        ESP_LOGW(AXP2101_TAG,
+                 "DCDC UVP poweroff disabled for test: REG23 0x%02X -> 0x%02X (OVP bit kept)",
+                 old_value,
+                 new_value);
+    }
+}
+
+static void axp2101_dump_key_reg(i2c_master_dev_handle_t dev, uint8_t reg, const char *name)
+{
+    uint8_t value = 0;
+    esp_err_t ret = axp2101_read_reg(dev, reg, &value);
+    if (ret == ESP_OK) {
+        ESP_LOGI(AXP2101_TAG, "key 0x%02X %-18s = 0x%02X", reg, name, value);
+    } else {
+        ESP_LOGW(AXP2101_TAG, "key 0x%02X %-18s read failed: %s", reg, name, esp_err_to_name(ret));
+    }
+}
+
+static const char *axp2101_battery_direction_str(uint8_t status2)
+{
+    switch ((status2 >> 5) & 0x03) {
+    case 0:
+        return "standby";
+    case 1:
+        return "charge";
+    case 2:
+        return "discharge";
+    default:
+        return "reserved";
+    }
+}
+
+static const char *axp2101_charge_status_str(uint8_t status2)
+{
+    switch (status2 & 0x07) {
+    case 0:
+        return "tri_charge";
+    case 1:
+        return "pre_charge";
+    case 2:
+        return "constant_current";
+    case 3:
+        return "constant_voltage";
+    case 4:
+        return "charge_done";
+    case 5:
+        return "not_charging";
+    default:
+        return "reserved";
+    }
+}
+
+static uint16_t axp2101_dcdc1_mv(uint8_t reg82)
+{
+    return (uint16_t)((reg82 & 0x1F) * 100 + 1500);
+}
+
+static uint16_t axp2101_dcdc23_mv(uint8_t value)
+{
+    value &= 0x7F;
+    if (value < 71) {
+        return (uint16_t)(500 + value * 10);
+    }
+    if (value < 88) {
+        return (uint16_t)(1220 + (value - 71) * 20);
+    }
+    return (uint16_t)(1600 + (value - 88) * 100);
+}
+
+static uint16_t axp2101_dcdc4_mv(uint8_t value)
+{
+    value &= 0x7F;
+    if (value < 71) {
+        return (uint16_t)(500 + value * 10);
+    }
+    return (uint16_t)(1220 + (value - 71) * 20);
+}
+
+static void axp2101_log_poweroff_status(uint8_t status)
+{
+    ESP_LOGI(AXP2101_TAG,
+             "PWROFF_STATUS=0x%02X over_temp=%u dc_ov=%u dc_uv=%u vbus_ov=%u vsys_uv=%u sw_off=%u pwron_off=%u",
+             status,
+             (unsigned)((status >> 7) & 1),
+             (unsigned)((status >> 6) & 1),
+             (unsigned)((status >> 5) & 1),
+             (unsigned)((status >> 4) & 1),
+             (unsigned)((status >> 3) & 1),
+             (unsigned)((status >> 2) & 1),
+             (unsigned)((status >> 1) & 1));
+}
+
+static void axp2101_decode_boot_registers(i2c_master_dev_handle_t dev)
+{
+    uint8_t r00 = 0, r01 = 0, r10 = 0, r15 = 0, r16 = 0, r18 = 0, r19 = 0;
+    uint8_t r20 = 0, r21 = 0, r22 = 0, r23 = 0, r24 = 0, r25 = 0, r26 = 0, r27 = 0;
+    uint8_t r80 = 0, r81 = 0, r82 = 0, r83 = 0, r84 = 0, r85 = 0, r90 = 0, r91 = 0;
+
+    if (axp2101_read_reg(dev, 0x00, &r00) != ESP_OK ||
+        axp2101_read_reg(dev, 0x01, &r01) != ESP_OK ||
+        axp2101_read_reg(dev, 0x10, &r10) != ESP_OK ||
+        axp2101_read_reg(dev, 0x15, &r15) != ESP_OK ||
+        axp2101_read_reg(dev, 0x16, &r16) != ESP_OK ||
+        axp2101_read_reg(dev, 0x18, &r18) != ESP_OK ||
+        axp2101_read_reg(dev, 0x19, &r19) != ESP_OK ||
+        axp2101_read_reg(dev, 0x20, &r20) != ESP_OK ||
+        axp2101_read_reg(dev, 0x21, &r21) != ESP_OK ||
+        axp2101_read_reg(dev, 0x22, &r22) != ESP_OK ||
+        axp2101_read_reg(dev, 0x23, &r23) != ESP_OK ||
+        axp2101_read_reg(dev, 0x24, &r24) != ESP_OK ||
+        axp2101_read_reg(dev, 0x25, &r25) != ESP_OK ||
+        axp2101_read_reg(dev, 0x26, &r26) != ESP_OK ||
+        axp2101_read_reg(dev, 0x27, &r27) != ESP_OK ||
+        axp2101_read_reg(dev, 0x80, &r80) != ESP_OK ||
+        axp2101_read_reg(dev, 0x81, &r81) != ESP_OK ||
+        axp2101_read_reg(dev, 0x82, &r82) != ESP_OK ||
+        axp2101_read_reg(dev, 0x83, &r83) != ESP_OK ||
+        axp2101_read_reg(dev, 0x84, &r84) != ESP_OK ||
+        axp2101_read_reg(dev, 0x85, &r85) != ESP_OK ||
+        axp2101_read_reg(dev, 0x90, &r90) != ESP_OK ||
+        axp2101_read_reg(dev, 0x91, &r91) != ESP_OK) {
+        ESP_LOGW(AXP2101_TAG, "decode skipped: required register read failed");
+        return;
+    }
+
+    ESP_LOGI(AXP2101_TAG,
+             "status1 VBUS_GOOD=%u BATFET=%u BAT_PRESENT=%u THERMAL_REG=%u CURRENT_LIMIT=%u",
+             (unsigned)((r00 >> 5) & 1),
+             (unsigned)((r00 >> 4) & 1),
+             (unsigned)((r00 >> 3) & 1),
+             (unsigned)((r00 >> 1) & 1),
+             (unsigned)(r00 & 1));
+    ESP_LOGI(AXP2101_TAG,
+             "status2 SYS_ON=%u VINDPM=%u BAT_DIR=%s CHG=%s",
+             (unsigned)((r01 >> 4) & 1),
+             (unsigned)((r01 >> 3) & 1),
+             axp2101_battery_direction_str(r01),
+             axp2101_charge_status_str(r01));
+    ESP_LOGI(AXP2101_TAG,
+             "COMMON=0x%02X off_discharge=%u pwrok_restart=%u pwron_16s_shutdown=%u restart_req=%u softoff_req=%u",
+             r10,
+             (unsigned)((r10 >> 5) & 1),
+             (unsigned)((r10 >> 3) & 1),
+             (unsigned)((r10 >> 2) & 1),
+             (unsigned)((r10 >> 1) & 1),
+             (unsigned)(r10 & 1));
+    ESP_LOGI(AXP2101_TAG,
+             "PWRON_SRC=0x%02X vbus_good=%u irq_low=%u pwron_key=%u",
+             r20,
+             (unsigned)((r20 >> 2) & 1),
+             (unsigned)((r20 >> 1) & 1),
+             (unsigned)(r20 & 1));
+    axp2101_log_poweroff_status(r21);
+    ESP_LOGI(AXP2101_TAG,
+             "PWROFF_EN=0x%02X die_temp_l2=%u pwron_offlevel=%u offlevel_action=%s",
+             r22,
+             (unsigned)((r22 >> 2) & 1),
+             (unsigned)((r22 >> 1) & 1),
+             (r22 & 1) ? "restart" : "poweroff");
+    ESP_LOGI(AXP2101_TAG,
+             "DCDC_UV_OV_POWEROFF=0x%02X hv=%u dc5_uv=%u dc4_uv=%u dc3_uv=%u dc2_uv=%u dc1_uv=%u",
+             r23,
+             (unsigned)((r23 >> 5) & 1),
+             (unsigned)((r23 >> 4) & 1),
+             (unsigned)((r23 >> 3) & 1),
+             (unsigned)((r23 >> 2) & 1),
+             (unsigned)((r23 >> 1) & 1),
+             (unsigned)(r23 & 1));
+    ESP_LOGI(AXP2101_TAG,
+             "limits VINDPM=%umV IINLIM_CODE=%u WATCHDOG=%s timeout_code=%u VOFF=%umV",
+             (unsigned)(3880 + (r15 & 0x0F) * 80),
+             (unsigned)(r16 & 0x07),
+             (r18 & 0x01) ? "enabled" : "disabled",
+             (unsigned)(r19 & 0x07),
+             (unsigned)(2600 + (r24 & 0x07) * 100));
+    ESP_LOGI(AXP2101_TAG,
+             "sequence PWROK=0x%02X SLEEP_WAKE=0x%02X IRQ_OFF_ON=0x%02X",
+             r25,
+             r26,
+             r27);
+    ESP_LOGI(AXP2101_TAG,
+             "DCDC_ENABLE d1=%u d2=%u d3=%u d4=%u d5=%u FORCE_PWM=0x%02X",
+             (unsigned)(r80 & 1),
+             (unsigned)((r80 >> 1) & 1),
+             (unsigned)((r80 >> 2) & 1),
+             (unsigned)((r80 >> 3) & 1),
+             (unsigned)((r80 >> 4) & 1),
+             r81);
+    ESP_LOGI(AXP2101_TAG,
+             "DCDC_VOLT d1=%umV d2=%umV d3=%umV d4=%umV",
+             (unsigned)axp2101_dcdc1_mv(r82),
+             (unsigned)axp2101_dcdc23_mv(r83),
+             (unsigned)axp2101_dcdc23_mv(r84),
+             (unsigned)axp2101_dcdc4_mv(r85));
+    ESP_LOGI(AXP2101_TAG, "LDO_ENABLE 90=0x%02X 91=0x%02X", r90, r91);
+}
+
+static void axp2101_log_and_clear_irq(i2c_master_dev_handle_t dev)
+{
+    uint8_t irq0 = 0, irq1 = 0, irq2 = 0;
+    if (axp2101_read_reg(dev, 0x48, &irq0) != ESP_OK ||
+        axp2101_read_reg(dev, 0x49, &irq1) != ESP_OK ||
+        axp2101_read_reg(dev, 0x4A, &irq2) != ESP_OK) {
+        ESP_LOGW(AXP2101_TAG, "irq status read failed");
+        return;
+    }
+
+    ESP_LOGI(AXP2101_TAG, "IRQ_STATUS_BEFORE_CLEAR 48=%02X 49=%02X 4A=%02X", irq0, irq1, irq2);
+    if (irq0) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(axp2101_write_reg(dev, 0x48, irq0));
+    }
+    if (irq1) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(axp2101_write_reg(dev, 0x49, irq1));
+    }
+    if (irq2) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(axp2101_write_reg(dev, 0x4A, irq2));
+    }
+}
+
+static void axp2101_dump_range(i2c_master_dev_handle_t dev, uint8_t start, uint8_t end)
+{
+    for (uint16_t base = start; base <= end; base += 16) {
+        char line[96];
+        int pos = snprintf(line, sizeof(line), "%02X:", (unsigned)base);
+        if (pos < 0) {
+            return;
+        }
+
+        for (uint16_t reg = base; reg <= end && reg < base + 16; reg++) {
+            uint8_t value = 0;
+            esp_err_t ret = axp2101_read_reg(dev, (uint8_t)reg, &value);
+            int written = snprintf(line + pos,
+                                   sizeof(line) - (size_t)pos,
+                                   ret == ESP_OK ? " %02X" : " --",
+                                   value);
+            if (written < 0) {
+                return;
+            }
+            pos += written;
+            if ((size_t)pos >= sizeof(line)) {
+                break;
+            }
+        }
+
+        ESP_LOGI(AXP2101_TAG, "%s", line);
+    }
+}
+
+static void axp2101_dump_boot_registers(void)
+{
+    esp_err_t ret = bsp_i2c_init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(AXP2101_TAG, "i2c init failed before dump: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    if (!bus) {
+        ESP_LOGW(AXP2101_TAG, "i2c bus unavailable before dump");
+        return;
+    }
+
+    ret = i2c_master_probe(bus, AXP2101_I2C_ADDR, 100);
+    if (ret != ESP_OK) {
+        ESP_LOGW(AXP2101_TAG, "not found at 0x%02X: %s", AXP2101_I2C_ADDR, esp_err_to_name(ret));
+        return;
+    }
+
+    const i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = AXP2101_I2C_ADDR,
+        .scl_speed_hz = 100000,
+    };
+    i2c_master_dev_handle_t dev = NULL;
+    ret = i2c_master_bus_add_device(bus, &dev_cfg, &dev);
+    if (ret != ESP_OK) {
+        ESP_LOGW(AXP2101_TAG, "add device failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    axp2101_disable_dcdc_uvp_poweroff(dev);
+    ESP_LOGI(AXP2101_TAG, "boot register dump begin addr=0x%02X diagnostic", AXP2101_I2C_ADDR);
+    axp2101_dump_key_reg(dev, 0x00, "mode/charge status");
+    axp2101_dump_key_reg(dev, 0x03, "chip id");
+    axp2101_dump_key_reg(dev, 0x10, "common config");
+    axp2101_dump_key_reg(dev, 0x12, "batfet control");
+    axp2101_dump_key_reg(dev, 0x13, "die temp cfg");
+    axp2101_dump_key_reg(dev, 0x20, "power-on status");
+    axp2101_dump_key_reg(dev, 0x21, "power-off status");
+    axp2101_dump_key_reg(dev, 0x22, "power-off enable");
+    axp2101_dump_key_reg(dev, 0x23, "dcdc ovp/uvp off");
+    axp2101_dump_key_reg(dev, 0x48, "irq status1");
+    axp2101_dump_key_reg(dev, 0x80, "dcdc enable");
+    axp2101_dump_key_reg(dev, 0x90, "ldo enable");
+    axp2101_decode_boot_registers(dev);
+    axp2101_log_and_clear_irq(dev);
+    axp2101_dump_range(dev, 0x00, 0x4F);
+    axp2101_dump_range(dev, 0x80, 0x9F);
+    ESP_LOGI(AXP2101_TAG, "boot register dump end");
+
+    ret = i2c_master_bus_rm_device(dev);
+    if (ret != ESP_OK) {
+        ESP_LOGW(AXP2101_TAG, "remove device failed: %s", esp_err_to_name(ret));
+    }
+}
 
 static const char *reset_reason_to_str(esp_reset_reason_t reason)
 {
@@ -236,6 +600,7 @@ void app_main(void)
     init_cjson_psram_hooks();
     log_boot_info();
     init_nvs_tolerant();
+    axp2101_dump_boot_registers();
 
     // 1. 立即启动屏幕背光与 LVGL 底层引擎
     ESP_LOGI(TAG, "display start");
@@ -247,20 +612,22 @@ void app_main(void)
     ESP_LOGI(TAG, "display ready");
     vTaskDelay(pdMS_TO_TICKS(50));
 
+    ESP_LOGI(TAG, "brightness set low for boot animation");
+    bsp_display_brightness_set(BOOT_BRIGHTNESS_START);
+
     ESP_LOGI(TAG, "display lock");
     bsp_display_lock(-1);
-
-    ESP_LOGI(TAG, "brightness set");
-    bsp_display_brightness_set(50);
 
     // 2. 加载并展示 3 秒优雅的启动动画
     ESP_LOGI(TAG, "show boot animation");
     show_boot_animation();
+    ESP_LOGI(TAG, "boot animation ready");
 
     bsp_display_unlock();
 
     // 3. 保持屏幕运行动画，主任务在此阻塞等待 3 秒
     vTaskDelay(pdMS_TO_TICKS(3000));
+    bsp_display_brightness_set(BOOT_BRIGHTNESS_TARGET);
 
     // 4. 动画结束后，执行其余后台硬件及串口初始化
     ESP_LOGI(TAG, "stm32 interface init");

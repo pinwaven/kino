@@ -21,10 +21,13 @@
 
 #define TAG "WIFI_PROV"
 #define APP_WORKER_TASK_CORE 1
+#define WIFI_TX_POWER_QDBM 28
 
 static volatile wifi_prov_state_t s_state = WIFI_PROV_STATE_IDLE;
 static char s_target_ssid[33] = {0};
 static char s_got_ip[16] = {0};
+static int8_t s_rssi = 0;
+static bool s_rssi_valid = false;
 static char s_pending_ssid[33] = {0};
 static char s_pending_pass[65] = {0};
 
@@ -45,6 +48,7 @@ static bool s_radio_paused = false;
 static volatile bool s_disconnecting_for_reprovision = false;
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data);
+static void update_sta_rssi(void);
 
 static void configure_ap_captive_portal_dhcp(void)
 {
@@ -521,6 +525,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         bool was_connected = s_sta_connected;
         s_sta_connected = false;
         memset(s_got_ip, 0, sizeof(s_got_ip));
+        s_rssi_valid = false;
         if (s_radio_paused) {
             ESP_LOGI(TAG, "ignored disconnect while radio is paused");
             return;
@@ -550,7 +555,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *evt = data;
         snprintf(s_got_ip, sizeof(s_got_ip), IPSTR, IP2STR(&evt->ip_info.ip));
-        ESP_LOGI(TAG, "Connected, IP: %s", s_got_ip);
+        update_sta_rssi();
+        ESP_LOGI(TAG, "Connected, IP: %s RSSI: %s%d dBm",
+                 s_got_ip,
+                 s_rssi_valid ? "" : "N/A ",
+                 s_rssi_valid ? s_rssi : 0);
         s_sta_connected = true;
         if (s_pending_ssid[0]) {
             save_sta_credentials(s_pending_ssid, s_pending_pass);
@@ -563,6 +572,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
             ESP_LOGW(TAG, "STA lost IP, reconnecting to refresh DHCP lease");
             s_sta_connected = false;
             memset(s_got_ip, 0, sizeof(s_got_ip));
+            s_rssi_valid = false;
             s_state = WIFI_PROV_STATE_CONNECTING;
             s_sta_reconnect_pending = true;
             esp_wifi_disconnect();
@@ -574,6 +584,29 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 
 static bool s_starting = false;
 static bool s_stopping = false;
+
+static void apply_wifi_tx_power_limit(void)
+{
+    esp_err_t ret = esp_wifi_set_max_tx_power(WIFI_TX_POWER_QDBM);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Wi-Fi TX power limited to %.2f dBm", WIFI_TX_POWER_QDBM / 4.0f);
+    } else {
+        ESP_LOGW(TAG, "set Wi-Fi TX power failed: %s", esp_err_to_name(ret));
+    }
+}
+
+static void update_sta_rssi(void)
+{
+    wifi_ap_record_t ap = {0};
+    esp_err_t ret = esp_wifi_sta_get_ap_info(&ap);
+    if (ret == ESP_OK) {
+        s_rssi = ap.rssi;
+        s_rssi_valid = true;
+    } else {
+        s_rssi = 0;
+        s_rssi_valid = false;
+    }
+}
 
 esp_err_t wifi_prov_start(void)
 {
@@ -616,7 +649,7 @@ esp_err_t wifi_prov_start(void)
     ESP_LOGI(TAG, "starting provisioning AP: ssid=%s sta_connected=%d", WIFI_PROV_AP_SSID, s_sta_connected);
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_mode(s_sta_connected ? WIFI_MODE_APSTA : WIFI_MODE_AP));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_max_tx_power(40));
+    apply_wifi_tx_power_limit();
     log_wifi_mode("after set_mode");
     configure_ap_captive_portal_dhcp();
 
@@ -681,6 +714,7 @@ esp_err_t wifi_prov_stop(void)
     if (s_sta_connected) {
         esp_wifi_set_mode(WIFI_MODE_STA);
         s_state = WIFI_PROV_STATE_CONNECTED;
+        update_sta_rssi();
     } else if (s_wifi_started) {
         esp_wifi_disconnect();
         esp_wifi_stop();
@@ -694,6 +728,7 @@ esp_err_t wifi_prov_stop(void)
         }
         s_state = WIFI_PROV_STATE_IDLE;
         memset(s_got_ip, 0, sizeof(s_got_ip));
+        s_rssi_valid = false;
     }
 
     s_stopping = false;
@@ -737,6 +772,7 @@ esp_err_t wifi_prov_auto_connect_saved(void)
 
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+    apply_wifi_tx_power_limit();
     ret = start_wifi_driver();
     if (ret != ESP_OK) {
         s_starting = false;
@@ -769,6 +805,7 @@ esp_err_t wifi_prov_pause_radio(void)
     s_sta_connected = false;
     s_sta_reconnect_pending = false;
     memset(s_got_ip, 0, sizeof(s_got_ip));
+    s_rssi_valid = false;
     if (s_state == WIFI_PROV_STATE_CONNECTED || s_state == WIFI_PROV_STATE_CONNECTING) {
         s_state = WIFI_PROV_STATE_IDLE;
     }
@@ -807,13 +844,20 @@ esp_err_t wifi_prov_resume_radio(void)
     s_sta_connected = false;
     s_sta_reconnect_pending = false;
     memset(s_got_ip, 0, sizeof(s_got_ip));
+    s_rssi_valid = false;
     return wifi_prov_auto_connect_saved();
 }
 
 
 void wifi_prov_get_status(wifi_prov_status_t *out)
 {
+    if (s_sta_connected || s_state == WIFI_PROV_STATE_CONNECTED) {
+        update_sta_rssi();
+    }
+
     out->state = s_state;
     strlcpy(out->target_ssid, s_target_ssid, sizeof(out->target_ssid));
     strlcpy(out->got_ip, s_got_ip, sizeof(out->got_ip));
+    out->rssi = s_rssi;
+    out->rssi_valid = s_rssi_valid;
 }

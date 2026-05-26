@@ -106,11 +106,13 @@ static bool is_dimmed = false;
 static bool allow_auto_dim = true;
 static bool s_in_diagnostic = false;
 static uint32_t last_dim_restore_ms;
-static const int BRIGHTNESS_NORMAL = 66;
+static const int BRIGHTNESS_NORMAL = 75;
 static const int BRIGHTNESS_DIMMED = 20;
+static const int BRIGHTNESS_WIFI = 35;
 static const uint32_t INACTIVITY_TIMEOUT_MS = 20000;
 static const uint32_t WAKE_ARM_GUARD_MS = 500;
 static const uint32_t INSERT_CARD_TIMEOUT_MS = 30000;
+static const uint32_t READY_DIM_TAP_WINDOW_MS = 900;
 static const uint32_t ERROR_INACTIVITY_TIMEOUT_MS = 30000;
 static const uint32_t CARD_AWAKE_HOLD_MS = 60000;
 static const uint32_t REFR_PERIOD_NORMAL = 16;
@@ -137,6 +139,8 @@ static const int OVERLAY_LOGO_DRIFT_RADIUS_Y = 9;
 static const int OVERLAY_LOGO_DRIFT_PHASES = 24;
 static uint32_t network_recover_until_ms;
 static uint32_t keep_awake_until_ms;
+static uint32_t ready_dim_tap_first_ms;
+static uint8_t ready_dim_tap_count;
 static uint32_t insert_card_wait_until_ms;
 static test_flow_state_t last_flow_state = TEST_FLOW_PREP_HOMING;
 static test_flow_state_t current_flow_state = TEST_FLOW_PREP_HOMING;
@@ -159,6 +163,7 @@ static void main_flow_click_cb(lv_event_t *e);
 static void diag_long_press_timer_cb(lv_timer_t *timer);
 static void cancel_diag_long_press(void);
 static void set_diag_long_press_feedback(bool active);
+static void enter_dim_mode(const char *reason);
 static bool pass_overlay_visible(void);
 static void pass_overlay_open(void);
 static void disarm_wait_card_ui(void);
@@ -294,11 +299,13 @@ static void sys_worker_task(void *arg)
             }
 
             case SYS_WORKER_WIFI_AUTO_CONNECT: {
+                bsp_display_brightness_set(BRIGHTNESS_WIFI);
                 wifi_prov_auto_connect_saved();
                 break;
             }
 
             case SYS_WORKER_PROV_START: {
+                bsp_display_brightness_set(BRIGHTNESS_WIFI);
                 esp_err_t err = wifi_prov_start();
                 if (err != ESP_OK) {
                     ESP_LOGE(TAG, "prov start failed: %s", esp_err_to_name(err));
@@ -314,6 +321,9 @@ static void sys_worker_task(void *arg)
             case SYS_WORKER_PROV_STOP: {
                 ui_wifi_prov_clear_stop_after_task();
                 wifi_prov_stop();
+                if (!is_dimmed) {
+                    bsp_display_brightness_set(BRIGHTNESS_NORMAL);
+                }
                 ui_wifi_prov_clear_task_pending();
                 break;
             }
@@ -599,6 +609,54 @@ static void overlay_event_cb(lv_event_t *e)
     }
 }
 
+static void enter_dim_mode(const char *reason)
+{
+    if (is_dimmed) {
+        return;
+    }
+
+    if (flow_retryable_error_state(current_flow_state)) {
+        set_flow_glint_paused(true);
+    } else {
+        set_flow_stage_scroll_hidden(true);
+    }
+    bsp_display_brightness_set(BRIGHTNESS_DIMMED);
+    if (!flow_render_paused) {
+        lv_timer_set_period(lv_display_get_refr_timer(NULL), REFR_PERIOD_DIMMED);
+    }
+    if (flow_timer) {
+        lv_timer_set_period(flow_timer, REFR_PERIOD_DIMMED);
+    }
+    is_dimmed = true;
+    dimmed_start_time_ms = lv_tick_get();
+    s_overlay_logo_drift_step = 0;
+    sleep_command_sent = false;
+    if (flow_logo_label) {
+        flow_logo_last_color = lv_color_hex(0x7B8794);
+        lv_obj_set_style_text_color(flow_logo_label, flow_logo_last_color, 0);
+    }
+    if (flow_logo_sweep_mask) {
+        stop_flow_logo_sweep();
+    }
+    if (flow_phase_label && current_flow_state == TEST_FLOW_WAIT_CARD) {
+        lv_label_set_text(flow_phase_label, "");
+    }
+    bool main_flow_visible = main_page && !lv_obj_has_flag(main_page, LV_OBJ_FLAG_HIDDEN);
+    if (overlay) {
+        if (main_flow_visible) {
+            lv_obj_remove_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(overlay);
+        } else {
+            lv_obj_add_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (overlay_logo_label) {
+        update_overlay_logo_idle_motion();
+        set_obj_hidden(overlay_logo_label, !main_flow_visible);
+    }
+    ESP_LOGI(TAG, "Screen dimmed by %s", reason ? reason : "request");
+}
+
 static void inactivity_timer_cb(lv_timer_t *t)
 {
     (void)t;
@@ -661,45 +719,7 @@ static void inactivity_timer_cb(lv_timer_t *t)
                            INACTIVITY_TIMEOUT_MS;
 
     if (inactive_time >= dim_timeout && !is_dimmed) {
-        if (flow_retryable_error_state(current_flow_state)) {
-            set_flow_glint_paused(true);
-        } else {
-            set_flow_stage_scroll_hidden(true);
-        }
-        bsp_display_brightness_set(BRIGHTNESS_DIMMED);
-        if (!flow_render_paused) {
-            lv_timer_set_period(lv_display_get_refr_timer(NULL), REFR_PERIOD_DIMMED);
-        }
-        if (flow_timer) {
-            lv_timer_set_period(flow_timer, REFR_PERIOD_DIMMED);
-        }
-        is_dimmed = true;
-        dimmed_start_time_ms = lv_tick_get();
-        s_overlay_logo_drift_step = 0;
-        sleep_command_sent = false;
-        if (flow_logo_label) {
-            flow_logo_last_color = lv_color_hex(0x7B8794);
-            lv_obj_set_style_text_color(flow_logo_label, flow_logo_last_color, 0);
-        }
-        if (flow_logo_sweep_mask) {
-            stop_flow_logo_sweep();
-        }
-        if (flow_phase_label && current_flow_state == TEST_FLOW_WAIT_CARD) {
-            lv_label_set_text(flow_phase_label, "");
-        }
-        bool main_flow_visible = main_page && !lv_obj_has_flag(main_page, LV_OBJ_FLAG_HIDDEN);
-        if (overlay) {
-            if (main_flow_visible) {
-                lv_obj_remove_flag(overlay, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_move_foreground(overlay);
-            } else {
-                lv_obj_add_flag(overlay, LV_OBJ_FLAG_HIDDEN);
-            }
-        }
-        if (overlay_logo_label) {
-            update_overlay_logo_idle_motion();
-            set_obj_hidden(overlay_logo_label, !main_flow_visible);
-        }
+        enter_dim_mode("inactivity");
         ESP_LOGI(TAG, "Screen dimmed due to %dms inactivity", (int)inactive_time);
     }
 }
@@ -899,36 +919,9 @@ static void set_diag_long_press_feedback(bool active)
             lv_obj_set_style_arc_opa(flow_ring_main, LV_OPA_COVER, LV_PART_INDICATOR);
             lv_obj_set_style_arc_opa(flow_ring_main, LV_OPA_COVER, LV_PART_MAIN);
         }
-        if (flow_halo) {
-            lv_obj_set_style_shadow_width(flow_halo, 22, 0);
-            lv_obj_set_style_shadow_color(flow_halo, accent, 0);
-            lv_obj_set_style_shadow_opa(flow_halo, LV_OPA_50, 0);
-        }
-        for (int i = 0; i < FLOW_GLINT_DOT_COUNT; i++) {
-            if (flow_glint_dots[i]) {
-                lv_obj_add_flag(flow_glint_dots[i], LV_OBJ_FLAG_HIDDEN);
-            }
-        }
-        if (flow_logo_label) {
-            lv_obj_set_style_text_color(flow_logo_label, accent, 0);
-            lv_obj_set_style_text_opa(flow_logo_label, LV_OPA_COVER, 0);
-        }
-        stop_flow_logo_sweep();
         return;
     }
 
-    if (flow_halo) {
-        lv_obj_set_style_shadow_width(flow_halo, 0, 0);
-        lv_obj_set_style_shadow_color(flow_halo, lv_color_hex(0x6375EC), 0);
-        lv_obj_set_style_shadow_opa(flow_halo, LV_OPA_TRANSP, 0);
-    }
-    if (!flow_stage_scroll_hidden && !flow_glint_paused) {
-        for (int i = 0; i < FLOW_GLINT_DOT_COUNT; i++) {
-            if (flow_glint_dots[i]) {
-                lv_obj_remove_flag(flow_glint_dots[i], LV_OBJ_FLAG_HIDDEN);
-            }
-        }
-    }
     update_flow_stage_visuals(current_flow_state);
     update_flow_logo_effect(current_flow_state);
 }
@@ -1621,12 +1614,11 @@ static void update_flow_stage_visuals(test_flow_state_t state)
         }
     }
 
-    lv_color_t color = diag_long_press_feedback ? lv_color_hex(0xFF2EC4) :
-                       is_dimmed ? lv_color_hex(0x5E6B78) : flow_state_color(state);
+    lv_color_t color = is_dimmed ? lv_color_hex(0x5E6B78) : flow_state_color(state);
+    lv_color_t ring_color = diag_long_press_feedback ? lv_color_hex(0xFF2EC4) : color;
     lv_opa_t logo_opa = flow_report_display_state(state) ? LV_OPA_20 :
                          (!is_dimmed && state != TEST_FLOW_WAIT_CARD) ? LV_OPA_50 : LV_OPA_COVER;
-    int speed = diag_long_press_feedback ? -10 :
-                flow_retryable_error_state(state) ? 13 :
+    int speed = flow_retryable_error_state(state) ? 13 :
                 flow_report_display_state(state) ? 3 :
                 state == TEST_FLOW_WAIT_CARD ? 2 : 7;
 
@@ -1637,8 +1629,8 @@ static void update_flow_stage_visuals(test_flow_state_t state)
     bool visual_changed = diag_long_press_feedback || last_visual_state != state || last_visual_dimmed != is_dimmed;
     if (visual_changed) {
         lv_opa_t ring_opa = is_dimmed ? LV_OPA_40 : LV_OPA_80;
-        lv_obj_set_style_arc_color(flow_ring_main, color, LV_PART_INDICATOR);
-        lv_obj_set_style_arc_color(flow_ring_main, color, LV_PART_MAIN);
+        lv_obj_set_style_arc_color(flow_ring_main, ring_color, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_color(flow_ring_main, ring_color, LV_PART_MAIN);
         lv_obj_set_style_arc_opa(flow_ring_main, ring_opa, LV_PART_INDICATOR);
         lv_obj_set_style_arc_opa(flow_ring_main, ring_opa, LV_PART_MAIN);
 
@@ -1711,10 +1703,6 @@ static void update_flow_stage_visuals(test_flow_state_t state)
     if (base_angle < 0) {
         base_angle += 360;
     }
-    if (diag_long_press_feedback) {
-        return;
-    }
-
     int mid = FLOW_GLINT_DOT_COUNT / 2;
     for (int i = 0; i < FLOW_GLINT_DOT_COUNT; i++) {
         int angle = (base_angle + (i - mid) * 3 + 360) % 360;
@@ -1927,6 +1915,7 @@ static void main_flow_press_cb(lv_event_t *e)
 static void main_flow_click_cb(lv_event_t *e)
 {
     (void)e;
+    uint32_t now = lv_tick_get();
 
     if (diag_long_press_fired) {
         diag_long_press_fired = false;
@@ -1941,8 +1930,31 @@ static void main_flow_click_cb(lv_event_t *e)
         cancel_diag_long_press();
     }
 
+    if (current_flow_state == TEST_FLOW_WAIT_CARD) {
+        if (ready_dim_tap_count == 0 ||
+            (uint32_t)(now - ready_dim_tap_first_ms) > READY_DIM_TAP_WINDOW_MS) {
+            ready_dim_tap_first_ms = now;
+            ready_dim_tap_count = 1;
+        } else {
+            ready_dim_tap_count++;
+        }
+
+        if (ready_dim_tap_count >= 3) {
+            ready_dim_tap_count = 0;
+            ready_dim_tap_first_ms = 0;
+            if (flow_wait_card_armed) {
+                disarm_wait_card_ui();
+            }
+            enter_dim_mode("ready triple tap");
+            return;
+        }
+    } else {
+        ready_dim_tap_count = 0;
+        ready_dim_tap_first_ms = 0;
+    }
+
     if (current_flow_state == TEST_FLOW_WAIT_CARD && !flow_wait_card_armed) {
-        if ((uint32_t)(lv_tick_get() - last_dim_restore_ms) < WAKE_ARM_GUARD_MS) {
+        if ((uint32_t)(now - last_dim_restore_ms) < WAKE_ARM_GUARD_MS) {
             return;
         }
         arm_wait_card_ui();

@@ -219,6 +219,8 @@ static void update_stats(lv_timer_t * t) {
     // Memory and Uptime
     size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     size_t total_heap = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t min_free_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t largest_heap = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     size_t total_psram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
     
@@ -261,7 +263,12 @@ static void update_stats(lv_timer_t * t) {
         vPortFree(task_array);
     }
 
-    lv_label_set_text_fmt(lbl_heap, "SRAM: %d / %d KB", (int)(free_heap / 1024), (int)(total_heap / 1024));
+    lv_label_set_text_fmt(lbl_heap,
+                          "SRAM: %d/%d KB  MIN:%d  MAX:%d",
+                          (int)(free_heap / 1024),
+                          (int)(total_heap / 1024),
+                          (int)(min_free_heap / 1024),
+                          (int)(largest_heap / 1024));
     if (total_psram > 0) {
         lv_label_set_text_fmt(lbl_psram, "PSRAM: %d / %d KB", (int)(free_psram / 1024), (int)(total_psram / 1024));
     } else {

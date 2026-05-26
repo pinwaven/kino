@@ -337,7 +337,7 @@ esp_codec_dev_handle_t bsp_audio_codec_microphone_init(void)
 
 esp_err_t bsp_display_brightness_init(void)
 {
-    bsp_display_brightness_set(100);
+    bsp_display_brightness_set(18);
     return ESP_OK;
 }
 
@@ -532,7 +532,7 @@ static lv_display_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
             .rotation = cfg->rotation,
             .hor_res = BSP_LCD_H_RES,
             .ver_res = BSP_LCD_V_RES,
-            .buffer_height = 15,
+            .buffer_height = 12,
             .use_psram = true,
             .enable_ppa_accel = false,
             .require_double_buffer = true,
